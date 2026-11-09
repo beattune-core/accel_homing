@@ -904,6 +904,12 @@ def selected_axis_threshold(noise_peaks, first_contact_peaks, tested_threshold=N
             % (window, noise_max, impact_min, SELECTED_AXIS_MIN_WINDOW_G))
     midpoint = (noise_max + impact_min) / 2
     capped = tested_threshold is not None and tested_threshold < midpoint
+    if capped and tested_threshold <= noise_max:
+        raise ValueError(
+            "Tested threshold %.3f g is not above the homing-axis noise max %.3f g, so the "
+            "capped saved threshold would sit inside the noise; set a manual threshold inside "
+            "the window (noise max %.3f g, first-contact min %.3f g) or re-run calibration"
+            % (tested_threshold, noise_max, noise_max, impact_min))
     return {"threshold_g": tested_threshold if capped else midpoint, "midpoint_g": midpoint,
             "threshold_set_by": "tested_cap" if capped else "midpoint",
             "noise_max_g": noise_max, "impact_min_g": impact_min, "window_g": window}

@@ -67,7 +67,7 @@ else:  # Standalone offline analysis; do not mask package dependency errors.
                                      publish_captures, prepare_noise, publish_noise,
                                      motion_noise_peaks, choose_impact_metric,
                                      axis_check_peaks, axis_first_contact_peak, magnitude_check_peaks,
-                                      selected_axis_threshold,
+                                     selected_axis_threshold,
                                      SELECTED_AXIS_MIN_WINDOW_G)
 
 try:
@@ -2084,6 +2084,7 @@ class AccelHomingWorkflows:
                     "impact_peak_g": [r.get("impact_peak_g") for r in qualified],
                     "axis_noise_peak_g": [r.get("axis_noise_peak_g") for r in qualified],
                     # Post-trigger 30 ms maximum (includes the bounce); diagnostic only.
+                    # axis_impact_peak_g is a deprecated alias of the same values.
                     "axis_post_trigger_peak_g": [r.get("axis_impact_peak_g") for r in qualified],
                     "axis_impact_peak_g": [r.get("axis_impact_peak_g") for r in qualified],
                     # First contact excursion: the amplitude the detector must beat.
@@ -2096,7 +2097,8 @@ class AccelHomingWorkflows:
                     "calibration_step_g": session["threshold_step_g"],
                     "tested_threshold_g": tested_threshold,
                     "saved_threshold_g": threshold,
-                    "threshold_rule": "window_midpoint" if selected else "tested_plus_margin",
+                    "threshold_rule": (("window_midpoint" if window["threshold_set_by"] == "midpoint"
+                                        else "tested_cap") if selected else "tested_plus_margin"),
                     "threshold_set_by": window["threshold_set_by"] if selected else None,
                     "threshold_margin_g": margin,
                     "saved_threshold_tested": bool(selected and window["threshold_set_by"] == "tested_cap"),

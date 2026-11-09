@@ -67,6 +67,12 @@ class SelectedAxisSignalTests(unittest.TestCase):
         self.assertAlmostEqual(r["threshold_g"], 2.0)
         self.assertEqual(r["threshold_set_by"], "midpoint")
 
+    def test_cap_at_or_below_noise_max_is_refused(self):
+        with self.assertRaisesRegex(ValueError, "1.7.*1.9"):
+            charts.selected_axis_threshold([1.9], [3.0], 1.75)
+        with self.assertRaises(ValueError):
+            charts.selected_axis_threshold([1.9], [3.0], 1.9)
+
     def test_axis_check_peaks_refuses_missing_windows(self):
         capture = make_capture()
         capture["detector"]["onset_time_s"] = None

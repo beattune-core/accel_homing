@@ -108,15 +108,17 @@ post-trigger peak because that peak includes the bounce after the trigger,
 while the detector has to beat the first contact spike, which can be much
 weaker. `threshold_set_by` (`midpoint` or `tested_cap`) records which rule set
 the saved value; `axis_first_contact_peak_g` and `axis_post_trigger_peak_g` hold
-the per-check values. The noise maximum also includes the pre-pass moving homing-axis peak
-and the onset of any selected-axis early trigger in this calibration;
+the per-check values (`axis_impact_peak_g` is a deprecated alias of the
+post-trigger values). The noise maximum also includes the pre-pass moving
+homing-axis peak and the onset of any selected-axis early trigger in this calibration;
 `selected_axis_window.noise_max_source` (`validation`, `moving_noise` or
 `early_trigger`) records which one set it. A window narrower than 0.5 g is
-refused rather than saved (the message prints the noise maximum and the
+refused rather than saved, as is a tested candidate at or below the noise
+maximum that would cap the saved value inside the noise (the message prints the noise maximum and the
 first-contact minimum); check the mechanics and calibrate again, or set a
 manual `x_threshold` / `y_threshold` inside the measured window. XYZ models
 still save the tested threshold plus 0.5 g. The model records
-`impact_metric`, `threshold_rule` (`window_midpoint` or `tested_plus_margin`),
+`impact_metric`, `threshold_rule` (`window_midpoint`, `tested_cap` or `tested_plus_margin`),
 `selected_axis_window` (selected-axis models) and `metric_selection` (all
 models). Every model also stores per-check homing-axis and XYZ-magnitude noise
 and impact peaks from the same windows (`null` where a capture cannot provide
