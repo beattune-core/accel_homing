@@ -79,30 +79,57 @@ below 0.7, motion noise is mostly cross-axis and calibration uses the
 `selected_axis` metric; otherwise it keeps `xyz_magnitude`. Unless
 `START_THRESHOLD` is given, the start is seeded from the chosen metric's moving
 peak: the largest of the configured start, 1.2 x peak and peak + 0.1 g, on the
-grid. Accuracy-recovery recalibration also runs the pre-pass, with its explicit
-start.
+grid. The pre-pass dwells `calibration_settle_time` after enabling the motors
+so the first stroke does not start inside motor-enable ringing, and records
+each stroke's homing-axis and XYZ-magnitude peaks in `metric_selection`.
+A moving seed that replaces the stationary seed is saved as
+`motion_noise_seed`; the stationary seed is then marked `superseded_by`.
+
+Accuracy-recovery recalibration also runs the pre-pass with its inherited
+start (old threshold + 0.25 g). When the pre-pass picks a different metric than
+the one that produced the old threshold, that start is on the wrong scale (an
+XYZ-magnitude threshold is far above selected-axis impacts), so it is dropped
+and the moving-noise seed is used instead, with a console note. An explicit
+`START_THRESHOLD` is never overridden, but with the selected-axis metric a
+value above 1.2 x the moving homing-axis peak plus one step prints a warning
+that the first candidates may miss the weaker selected-axis impact.
 
 If the pre-pass cannot run (no motion_report trapq extractor, stroke too short,
 unmatched homing current), calibration warns `cross-axis noise check skipped:
-...; calibrating with XYZ magnitude` and continues. A cancel or fault during
+moving-noise pre-pass ...; calibrating with XYZ magnitude` and continues. A cancel or fault during
 the pre-pass aborts calibration.
 
 A selected-axis model saves the midpoint between the highest pre-impact
 homing-axis noise peak and the weakest homing-axis impact peak over the ten
 checks (noise window: arm to 3 ms before onset; impact window: 30 ms after
-onset). A window narrower than 0.5 g is refused rather than saved. XYZ models
+onset). The noise maximum also includes the pre-pass moving homing-axis peak
+and the onset of any selected-axis early trigger in this calibration;
+`selected_axis_window.noise_max_source` (`validation`, `moving_noise` or
+`early_trigger`) records which one set it. A window narrower than 0.5 g is
+refused rather than saved; check the mechanics and calibrate again, or set a
+manual `x_threshold` / `y_threshold` inside the measured window. XYZ models
 still save the tested threshold plus 0.5 g. The model records
 `impact_metric`, `threshold_rule` (`window_midpoint` or `tested_plus_margin`),
-`selected_axis_window` and `metric_selection`. Ordinary homes with a saved
+`selected_axis_window` (selected-axis models) and `metric_selection` (all
+models). Every model also stores per-check homing-axis and XYZ-magnitude noise
+and impact peaks from the same windows (`null` where a capture cannot provide
+them), and the console prints noise-to-threshold and threshold-to-impact
+margins for both metrics on save. These diagnostics never fail an XYZ
+calibration. Ordinary homes with a saved
 selected-axis model use the selected-axis detector; explicit `x_threshold` /
 `y_threshold` still take precedence.
 
 For the selected-axis detector only, after motor enable the plugin waits up to
 2.0 s (at least `enable_settle_time`) for a standstill reference quiet enough
 that the motion proof needs no noise bound (range at most 0.2 x threshold per
-axis). Otherwise it continues with the noise-bounded reference and prints
-`standstill reference not quiet after ...` with the ranges and limit. Above-floor
-noise during the wait still fails.
+axis). Decaying ringing keeps the wait going; steady noise, whose reference
+range has not shrunk by 10% over the last 0.3 s, stops it early. Otherwise it
+continues with the noise-bounded reference and prints
+`standstill reference not quiet after ...` with the ranges and limit, once per
+axis per Klipper session (later passes only go to the log). `baseline` status
+records `quiet_wait_s` and `quiet_fallback`. Selected-axis calibrations record
+`calibration_quiet_range_enforced: true`. Above-floor noise during the wait
+still fails.
 
 ## Threshold validity and homing attempts
 

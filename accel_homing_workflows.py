@@ -55,7 +55,7 @@ if __package__:
                                       compact_beta_home, write_beta_motion, prepare_capture,
                                       publish_captures, prepare_noise, publish_noise,
                                       motion_noise_peaks, choose_impact_metric,
-                                      axis_check_peaks, selected_axis_threshold,
+                                      axis_check_peaks, magnitude_check_peaks, selected_axis_threshold,
                                       SELECTED_AXIS_MIN_WINDOW_G)
 else:  # Standalone offline analysis; do not mask package dependency errors.
     from accel_homing_charts import (_accuracy_statistics as accuracy_statistics,
@@ -65,7 +65,7 @@ else:  # Standalone offline analysis; do not mask package dependency errors.
                                      compact_beta_home, write_beta_motion, prepare_capture,
                                      publish_captures, prepare_noise, publish_noise,
                                      motion_noise_peaks, choose_impact_metric,
-                                     axis_check_peaks, selected_axis_threshold,
+                                     axis_check_peaks, magnitude_check_peaks, selected_axis_threshold,
                                      SELECTED_AXIS_MIN_WINDOW_G)
 
 try:
@@ -982,13 +982,20 @@ class AccelHomingWorkflows:
             self._clear_noise_seeds()
 
     def _announce_calibration(self, session):
-        self._info("%s calibration starts at %.6g g with %.6g g steps; XYZ magnitude; "
+        metric = session.get("impact_metric")
+        detector = ("XYZ magnitude; no quietness or acceleration-derived motion proof"
+                    if metric == "xyz_magnitude" else
+                    "selected-axis signal with quiet reference and motion proof"
+                    if metric == "selected_axis" else
+                    "impact metric (XYZ magnitude or selected axis) and initial candidate "
+                    "follow from the moving cross-axis noise check")
+        self._info("%s calibration starts at %.6g g with %.6g g steps; %s; "
                    "impact after >20 mm then ten centered endstop checks with spread <= 2 mm; "
-                   "no quietness or acceleration-derived motion proof; returns settle for %.3f s; "
+                   "returns settle for %.3f s; "
                    "early triggers reverse their recorded signed start-to-halt travel; "
                    "no total homing-attempt limit" % (
                        session["axis"].upper(), session["candidate"], session["threshold_step_g"],
-                        session["calibration_settle_time_s"]))
+                       detector, session["calibration_settle_time_s"]))
 
     def _wait_center(self, reason):
         self._restore()
@@ -1070,7 +1077,8 @@ class AccelHomingWorkflows:
                 self._status("toolhead").get("homed_axes", ""),
                 tuple(sorted(self.owner.threshold_g.items())),
                 tuple(sorted(self.owner.impact_sign.items())),
-                self.owner.homing_accel, tuple(sorted(self.owner.back_off_dist.items())), tuple(sorted(motors)))
+                self.owner.homing_accel, tuple(sorted(self.owner.back_off_dist.items())),
+                tuple(sorted(motors)))
 
     def _preflight_noise(self, session=None):
         if self.session is not None and self.session is not session:
@@ -1529,8 +1537,26 @@ class AccelHomingWorkflows:
                 # A capture without detector times/baseline cannot give margins.
                 if (session.get("impact_metric") == "selected_axis"
                         and calibration_quality == "good"):
+                    detector = capture.get("detector")
+                    if isinstance(detector, dict):
+                        arm, onset = detector.get("arm_time_s"), detector.get("onset_time_s")
+                        if not all(isinstance(value, (int, float)) and not isinstance(value, bool)
+                                   and math.isfinite(value) for value in (arm, onset)):
+                            # Never substitute trigger_onset_time_s: only the
+                            # retained onset row aligns the noise/impact windows.
+                            self._missing_impact(
+                                "selected-axis capture has no retained arm/onset time for the "
+                                "homing-axis noise and impact windows", axis, record,
+                                source_record, detector, capture["samples"], arm,
+                                record.get("onset_time_s"))
                     raise self._error("selected-axis capture cannot be evaluated: %s" % exc)
                 record["axis_noise_peak_g"] = record["axis_impact_peak_g"] = None
+            try:
+                # XYZ-magnitude margins from the same windows; diagnostics only.
+                record["magnitude_noise_peak_g"], record["magnitude_impact_peak_g"] = \
+                    magnitude_check_peaks(capture)
+            except (ValueError, KeyError, TypeError, IndexError):
+                record["magnitude_noise_peak_g"] = record["magnitude_impact_peak_g"] = None
         if session.get("beta"):
             if not early_calibration:
                 self._validate_accuracy_capture(session, axis, source_record, detector_record,
@@ -1596,6 +1622,42 @@ class AccelHomingWorkflows:
         session["pending_record"] = record
         return record
 
+    @staticmethod
+    def _onset_stamp(value):
+        if (not isinstance(value, (tuple, list)) or len(value) != 4
+                or not all(isinstance(item, int) and not isinstance(item, bool) for item in value)
+                or not 0 <= value[0] <= 0xFFFFFFFF or not 0 < value[1] <= 0xFFFFFFFF
+                or value[3] < 2 or not 0 <= value[2] < value[3]):
+            return None
+        return tuple(value)
+
+    def _missing_impact(self, reason, axis, record, source_record, detector, samples, arm, onset):
+        """Record capture diagnostics and raise the measured-impact refusal."""
+        finite = lambda value: (isinstance(value, (int, float)) and not isinstance(value, bool)
+                                and math.isfinite(value))
+        number = lambda value: value if finite(value) else None
+        stamp = self._onset_stamp
+        diagnostics = {"reason": reason, "axis": axis, "sample_count": len(samples),
+                       "first_sample_time_s": samples[0][0], "last_sample_time_s": samples[-1][0],
+                       "arm_time_s": number(arm), "recorded_onset_time_s": number(onset),
+                       "capture_onset_time_s": number(detector.get("onset_time_s")),
+                       "onset_sample": stamp(source_record.get("onset_sample")),
+                       "capture_onset_sample": stamp(detector.get("onset_sample")),
+                       "onset_sample_matches": number(detector.get("onset_sample_matches")),
+                       "onset_sample_index": number(detector.get("onset_sample_index")),
+                       "onset_g": number(detector.get("onset_g")),
+                       "impact_peak_g": number(detector.get("impact_peak_g"))}
+        record["capture_diagnostics"] = diagnostics
+        detail = lambda value: "unknown" if value is None else "%.17g" % value
+        raise self._error("homing capture lacks the current measured impact "
+                          "(%s; recorded onset=%s, capture onset=%s, last sample=%s; "
+                          "matches=%s, index=%s, samples=%d)" % (
+                              reason, detail(diagnostics["recorded_onset_time_s"]),
+                              detail(diagnostics["capture_onset_time_s"]),
+                              detail(diagnostics["last_sample_time_s"]),
+                              detail(diagnostics["onset_sample_matches"]),
+                              detail(diagnostics["onset_sample_index"]), len(samples)))
+
     def _validate_accuracy_capture(self, session, axis, source_record, detector_record,
                                    record, capture, expected_threshold=None):
         detector = capture.get("detector")
@@ -1627,35 +1689,10 @@ class AccelHomingWorkflows:
             raise self._error("homing capture lacks the current pre-arm reference or armed samples")
         if record.get("result") == "impact":
             captured_onset = detector.get("onset_time_s")
-            def stamp(value):
-                if (not isinstance(value, (tuple, list)) or len(value) != 4
-                        or not all(isinstance(item, int) and not isinstance(item, bool) for item in value)
-                        or not 0 <= value[0] <= 0xFFFFFFFF or not 0 < value[1] <= 0xFFFFFFFF
-                        or value[3] < 2 or not 0 <= value[2] < value[3]):
-                    return None
-                return tuple(value)
+            stamp = self._onset_stamp
             def missing_impact(reason):
-                number = lambda value: value if finite(value) else None
-                diagnostics = {"reason": reason, "axis": axis, "sample_count": len(samples),
-                               "first_sample_time_s": samples[0][0], "last_sample_time_s": samples[-1][0],
-                               "arm_time_s": arm, "recorded_onset_time_s": number(onset),
-                               "capture_onset_time_s": number(captured_onset),
-                               "onset_sample": stamp(source_record.get("onset_sample")),
-                               "capture_onset_sample": stamp(detector.get("onset_sample")),
-                               "onset_sample_matches": number(detector.get("onset_sample_matches")),
-                               "onset_sample_index": number(detector.get("onset_sample_index")),
-                               "onset_g": number(detector.get("onset_g")),
-                               "impact_peak_g": number(detector.get("impact_peak_g"))}
-                record["capture_diagnostics"] = diagnostics
-                detail = lambda value: "unknown" if value is None else "%.17g" % value
-                raise self._error("homing capture lacks the current measured impact "
-                                  "(%s; recorded onset=%s, capture onset=%s, last sample=%s; "
-                                  "matches=%s, index=%s, samples=%d)" % (
-                                      reason, detail(diagnostics["recorded_onset_time_s"]),
-                                      detail(diagnostics["capture_onset_time_s"]),
-                                      detail(diagnostics["last_sample_time_s"]),
-                                      detail(diagnostics["onset_sample_matches"]),
-                                      detail(diagnostics["onset_sample_index"]), len(samples)))
+                self._missing_impact(reason, axis, record, source_record, detector,
+                                     samples, arm, onset)
             if (not finite(onset) or not finite(detector.get("onset_g"))
                     or not finite(detector.get("impact_peak_g")) or detector["impact_peak_g"] < 0):
                 missing_impact("invalid measured impact values")
@@ -2043,6 +2080,9 @@ class AccelHomingWorkflows:
                     "impact_peak_g": [r.get("impact_peak_g") for r in qualified],
                     "axis_noise_peak_g": [r.get("axis_noise_peak_g") for r in qualified],
                     "axis_impact_peak_g": [r.get("axis_impact_peak_g") for r in qualified],
+                    "magnitude_noise_peak_g": [r.get("magnitude_noise_peak_g") for r in qualified],
+                    "magnitude_impact_peak_g": [r.get("magnitude_impact_peak_g") for r in qualified],
+                    "metric_selection": dict(session.get("metric_selection") or {}),
                     "calibration_start_threshold_g": session["start_threshold_g"],
                     "calibration_step_g": session["threshold_step_g"],
                     "tested_threshold_g": tested_threshold,
@@ -2055,9 +2095,11 @@ class AccelHomingWorkflows:
                     "recovery": self._calibration_recovery_status(session),
                     "physical_position_verified": False}
         if selected:
-            metadata["metric_selection"] = dict(session.get("metric_selection") or {})
             metadata["selected_axis_window"] = {key: window[key] for key in
-                                                ("noise_max_g", "impact_min_g", "window_g")}
+                                                ("noise_max_g", "impact_min_g", "window_g",
+                                                 "noise_max_source", "noise_max_by_source_g")}
+        if session.get("motion_noise_seed") is not None:
+            metadata["motion_noise_seed"] = dict(session["motion_noise_seed"])
         if session.get("noise_seed") is not None:
             metadata["stationary_noise_seed"] = dict(session["noise_seed"])
         if session.get("stationary_noise") is not None:
@@ -2104,6 +2146,12 @@ class AccelHomingWorkflows:
             "The selected manual override is staged with this model." if recovery is not None and axis in self.manual_axes
             else "Explicit manual threshold overrides remain active." if axis in self.manual_axes
             else "The saved model supplies this axis threshold after restart."))
+        self._info("%s margins vs staged %.4g g over the ten checks (%s detector): %s; %s" % (
+            axis.upper(), threshold, self._metric_name(metadata["impact_metric"]),
+            self._margin_text("homing-axis", metadata["axis_noise_peak_g"],
+                              metadata["axis_impact_peak_g"], threshold),
+            self._margin_text("XYZ magnitude", metadata["magnitude_noise_peak_g"],
+                              metadata["magnitude_impact_peak_g"], threshold)))
         if save:
             if recovery is not None:
                 self._info("After SAVE_CONFIG succeeds and Klipper restarts, release and manually center XY, "
@@ -2137,16 +2185,54 @@ class AccelHomingWorkflows:
         """Return (saved threshold, selected-axis window or None) for the session metric."""
         if not selected:
             return self._calibration_saved_threshold(tested_threshold), None
+        # Noise evidence: the ten checks' pre-impact peaks, the moving pre-pass
+        # homing-axis peak and selected-axis early triggers of this session.
+        session = self.session
+        evidence = {"validation": [r.get("axis_noise_peak_g") for r in qualified]}
+        selection = session.get("metric_selection") or {}
+        if selection.get("source") == "moving_noise" and selection.get("axis_peak_g") is not None:
+            evidence["moving_noise"] = [selection["axis_peak_g"]]
+        early = [abs(r["onset_g"]) for r in session["records"]
+                 if r.get("early_capture_valid") is True and r.get("impact_metric") == "selected_axis"
+                 and type(r.get("onset_g")) in (int, float) and math.isfinite(r["onset_g"])]
+        if early:
+            evidence["early_trigger"] = early
+        noise = [peak for peaks in evidence.values() for peak in peaks]
         try:
-            window = selected_axis_threshold([r.get("axis_noise_peak_g") for r in qualified],
-                                             [r.get("axis_impact_peak_g") for r in qualified])
+            window = selected_axis_threshold(noise, [r.get("axis_impact_peak_g") for r in qualified])
         except ValueError as exc:
             raise self._error("cannot save selected-axis calibration: %s; the saved threshold "
                               "needs a homing-axis noise-to-impact window of at least %.3f g "
-                              "across the ten qualified homes" % (exc, SELECTED_AXIS_MIN_WINDOW_G))
+                              "(noise from %s). Next: check the mechanics (belt tension, loose "
+                              "parts, a soft or flexing stop) and calibrate again, or set a manual "
+                              "%s_threshold inside the measured noise-to-impact window if one exists" % (
+                                  exc, SELECTED_AXIS_MIN_WINDOW_G,
+                                  ", ".join("%s max %s" % (source, self._peak_text(peaks))
+                                            for source, peaks in evidence.items()),
+                                  session["axis"]))
+        window["noise_max_source"] = next(source for source, peaks in evidence.items()
+                                          if max(peaks) == window["noise_max_g"])
+        window["noise_max_by_source_g"] = {source: max(peaks) for source, peaks in evidence.items()}
         threshold = window["threshold_g"]
         self._validate_calibration_threshold(threshold, "saved selected-axis threshold")
         return threshold, window
+
+    @staticmethod
+    def _peak_text(peaks):
+        values = [peak for peak in peaks if type(peak) in (int, float) and math.isfinite(peak)]
+        return "%.3f g" % max(values) if values and len(values) == len(peaks) else "n/a"
+
+    @staticmethod
+    def _margin_text(label, noise_peaks, impact_peaks, threshold):
+        """noise->threshold and threshold->impact margins; diagnostics only."""
+        finite = lambda peaks: (peaks and all(type(peak) in (int, float) and math.isfinite(peak)
+                                              for peak in peaks))
+        if not finite(noise_peaks) or not finite(impact_peaks):
+            return "%s n/a" % label
+        noise, impact = max(noise_peaks), min(impact_peaks)
+        return ("%s noise max %.4g g (noise->threshold %+.4g g), impact min %.4g g "
+                "(threshold->impact %+.4g g)" % (label, noise, threshold - noise,
+                                                  impact, impact - threshold))
 
     def _calibration_saved_threshold(self, tested_threshold):
         # Always derive from the qualified candidate, never from an earlier
@@ -2391,6 +2477,13 @@ class AccelHomingWorkflows:
                 self._beta_check(session)
             toolhead.wait_moves()
             self._beta_check(session)
+            if not session.get("beta") and session.get("calibration_settle_time_s"):
+                # Calibration pre-pass only: let motor-enable ringing decay
+                # before the first stroke. Beta's own command is unchanged.
+                toolhead.dwell(session["calibration_settle_time_s"])
+                self._beta_check(session)
+                toolhead.wait_moves()
+                self._beta_check(session)
             session["beta_motor_settle_complete_time_s"] = toolhead.get_last_move_time()
             for iteration in range(1, NOISE_ITERATIONS + 1):
                 session["beta_current_motion"] = {"iteration": iteration, "stage": "baseline",
@@ -2528,7 +2621,7 @@ class AccelHomingWorkflows:
         try:
             plan = self._beta_motion_plan(session)
         except self.printer.command_error as exc:
-            reason = str(exc)
+            reason = self._prepass_reason(exc)
             session["impact_metric"] = "xyz_magnitude"
             session["metric_selection"] = {"source": "skipped", "axis_peak_g": None,
                                            "magnitude_peak_g": None, "ratio": None, "reason": reason}
@@ -2550,25 +2643,69 @@ class AccelHomingWorkflows:
             metric = choose_impact_metric(axis_peak, magnitude_peak)
         except ValueError as exc:
             raise self._error("cross-axis noise check produced no valid moving-noise peaks: %s" % exc)
+        # Peaks are computed; keep only the bounded records, not the raw captures.
+        session["beta_motion_iterations"] = [{"record": item["record"]}
+                                             for item in session["beta_motion_iterations"]]
         ratio = axis_peak / magnitude_peak if magnitude_peak > 0 else None
         session["impact_metric"] = metric
+        if metric == "selected_axis":
+            # The selected-axis detector always requires a quiet reference.
+            session["quiet_range_enforced"] = True
         session["metric_selection"] = {"source": "moving_noise", "axis_peak_g": axis_peak,
                                        "magnitude_peak_g": magnitude_peak, "ratio": ratio,
-                                       "reason": None}
+                                       "reason": None,
+                                       "iterations": [[axis_g, magnitude_g] for axis_g, magnitude_g in peaks]}
         peak = axis_peak if metric == "selected_axis" else magnitude_peak
-        if not session["explicit_start_threshold"]:
-            # The moving seed replaces the stationary seed: anchor it to the
-            # configured grid start, not the stationary candidate.
-            candidate = self._motion_seed(session, peak, session["configured_start_threshold_g"])
+        recovery = session.get("accuracy_recovery") or {}
+        source_metric = recovery.get("source_impact_metric")
+        inherited = (session["explicit_start_threshold"] and source_metric is not None
+                     and source_metric != metric)
+        if not session["explicit_start_threshold"] or inherited:
+            # The moving seed replaces the stationary seed (or a recovery start
+            # inherited from another metric's scale): anchor it to the
+            # configured grid start, not the stationary/inherited candidate.
+            origin = self.start_threshold if inherited else session["configured_start_threshold_g"]
+            candidate = self._motion_seed(session, peak, origin)
             self._validate_calibration_threshold(candidate, "moving-noise initial candidate")
             if candidate <= peak:
                 raise self._error("moving-noise initial candidate must exceed the measured peak")
+            replaced = ("accuracy_recovery_start" if inherited else
+                        "stationary_noise" if session.get("noise_seed") is not None else None)
+            session["motion_noise_seed"] = {"peak_g": peak, "impact_metric": metric,
+                                            "start_threshold_g": candidate, "replaced": replaced,
+                                            "replaced_start_threshold_g": session["start_threshold_g"]}
+            if session.get("noise_seed") is not None:
+                session["noise_seed"]["superseded_by"] = "motion_noise_seed"
+            if inherited:
+                self._info("Accuracy-recovery start %.6g g came from the %s threshold; the noise check "
+                           "chose %s, so calibration starts from the moving-noise seed %.6g g instead" % (
+                               session["start_threshold_g"], self._metric_name(source_metric),
+                               self._metric_name(metric), candidate))
             session.update(candidate=candidate, start_threshold_g=candidate)
-        self._info("Moving %s noise %.6g g, XYZ magnitude %.6g g (ratio %s); calibrating with %s "
-                   "from %.6g g" % (axis.upper(), axis_peak, magnitude_peak,
-                                    "n/a" if ratio is None else "%.3f" % ratio,
-                                    "selected-axis signal" if metric == "selected_axis" else "XYZ magnitude",
-                                    session["candidate"]))
+        elif metric == "selected_axis":
+            step = session["threshold_step_g"]
+            ceiling = 1.2 * axis_peak + step
+            if session["start_threshold_g"] > ceiling:
+                self._info("WARNING: START_THRESHOLD %.6g g is above 1.2 x moving %s noise %.6g g + one "
+                           "step (%.6g g); selected-axis impacts can be weaker than that, so the first "
+                           "candidates may miss the impact. Consider a lower START_THRESHOLD." % (
+                               session["start_threshold_g"], axis.upper(), axis_peak, ceiling))
+        self._info("Moving %s noise %.6g g, XYZ magnitude %.6g g (ratio %s; per stroke %s); "
+                   "calibrating with %s from %.6g g" % (
+                       axis.upper(), axis_peak, magnitude_peak,
+                       "n/a" if ratio is None else "%.3f" % ratio,
+                       ", ".join("%.3g/%.3g g" % pair for pair in peaks),
+                       self._metric_name(metric), session["candidate"]))
+
+    @staticmethod
+    def _metric_name(metric):
+        return "selected-axis signal" if metric == "selected_axis" else "XYZ magnitude"
+
+    @staticmethod
+    def _prepass_reason(exc):
+        """Calibration wording for a reused Beta pre-pass refusal; keeps the cause."""
+        reason = re.sub(r"^accel_homing: ", "", str(exc))
+        return re.sub(r"\bBeta\b", "moving-noise pre-pass", reason)
 
     def _beta_seed(self, session):
         peaks = [item["record"]["seed_magnitude_peak_g"] for item in session["beta_motion_iterations"]]
@@ -3187,6 +3324,9 @@ class AccelHomingWorkflows:
         session["accuracy_recovery_pending"] = {
             "axis": axis, "source_run_id": session["run_id"], "reason": reason,
             "previous_threshold_g": threshold, "start_threshold_g": candidate,
+            # The inherited start only makes sense on the same signal scale.
+            "source_impact_metric": ("xyz_magnitude" if self.simple_detection(axis)
+                                     else "selected_axis"),
             "initial_increment_g": 0.25, "threshold_step_g": self.threshold_step,
             "return_mm_signed": -displacement,
             "physical_position_verified": False,

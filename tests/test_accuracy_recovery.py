@@ -61,6 +61,9 @@ class AccuracyRecoveryTests(unittest.TestCase):
             self.assertEqual(rig.workflow.last_result["successes"], 10)
             metadata = json.loads(rig.configfile.saved[("accel_homing_model default", "x_metadata")])
             self.assertEqual(metadata["calibration_start_threshold_g"], 2.5)
+            # Manual threshold, no model: the legacy selected-axis detector set it.
+            self.assertEqual(rig.workflow.last_result["accuracy_recovery"]["source_impact_metric"],
+                             "selected_axis")
             self.assertEqual(rig.noise_calls, ["start", 1, 2, 3, "stop"])
             self.assertTrue(all(not path.exists() for path in rig.capture_directories))
             self.assertTrue(any("ACCEL_HOMING_ACCURACY" in line and "restart" in line.lower()

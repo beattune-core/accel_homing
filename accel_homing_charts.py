@@ -838,14 +838,26 @@ def axis_check_peaks(capture, axis):
     """Return (pre-impact noise peak, impact peak) of |a_axis - baseline| in g."""
     if axis not in ("x", "y", "z"):
         raise ValueError("Axis must be x, y or z")
+    index = "xyz".index(axis)
+    return _check_peaks(capture, lambda row, baseline: abs(row[index + 1] - baseline[index]))
+
+
+def magnitude_check_peaks(capture):
+    """Return (pre-impact noise peak, impact peak) of |a - baseline| (XYZ magnitude) in g,
+    over the same windows as axis_check_peaks."""
+    return _check_peaks(capture, lambda row, baseline: math.sqrt(sum(
+        (row[index + 1] - baseline[index]) ** 2 for index in range(3))))
+
+
+def _check_peaks(capture, signal):
     detector = capture.get("detector") or {}
     arm, onset = detector.get("arm_time_s"), detector.get("onset_time_s")
     if not _finite(arm) or not _finite(onset):
         raise ValueError("Capture detector arm/onset times are missing or not finite")
-    channel, reference = "xyz".index(axis) + 1, capture["baseline_g"]["xyz".index(axis)]
+    baseline = capture["baseline_g"]
     noise, impact = [], []
     for row in capture["samples"]:
-        value = abs(row[channel] - reference)
+        value = signal(row, baseline)
         if arm <= row[0] < onset - NOISE_ONSET_GUARD_S:
             noise.append(value)
         elif onset <= row[0] < onset + IMPACT_PEAK_WINDOW_S:

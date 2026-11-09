@@ -25,7 +25,9 @@ class NoiseRig(BetaRig):
     def stop_capture(self):
         capture = super().stop_capture()
         detector = capture.get("detector")
-        if not detector:
+        record = capture.get("_record") or {}
+        if not detector or record.get("travel_mm", 99.) <= 20.:
+            # Early triggers keep the base rig's consistent onset-sample capture.
             return capture
         axis = detector["axis"]
         noise, impact = self.axis_peaks[(self.capture_stops - 1) % len(self.axis_peaks)]
@@ -70,6 +72,33 @@ class SelectedAxisCalibrationTests(unittest.TestCase):
         self.assertEqual(session["start_threshold_g"], 1.75)
         self.assertEqual(rig.home_calls[0]["threshold"], 1.75)
         self.assertTrue(rig.central_moves())
+        start = next(line for line in rig.output if "calibration starts at" in line)
+        self.assertNotIn("XYZ magnitude;", start)
+        self.assertIn("moving cross-axis noise check", start)
+
+    def test_prepass_settles_after_enable_and_keeps_per_stroke_peaks_only(self):
+        rig = NoiseRig(noise=(3.1, 1.4))
+        rig.home_results.extend([{"impact_metric": "selected_axis"}] * 11)
+        dwell = rig.toolhead.dwell
+        def dwelling(delay):
+            rig.beta_events.append(("dwell", delay))
+            return dwell(delay)
+        rig.toolhead.dwell = dwelling
+        rig.workflow.cmd_CALIBRATE(GCmd(AXIS="Y", CENTERED=1, SAVE_CONFIG=0))
+        events = rig.beta_events
+        first_stroke = events.index(rig.central_moves()[0])
+        enable = max(number for number, event in enumerate(events[:first_stroke])
+                     if event[0] == "enable_and_settle")
+        self.assertIn(("dwell", rig.workflow.calibration_settle_time), events[enable:first_stroke])
+        session = rig.sessions[0]
+        iterations = session["metric_selection"]["iterations"]
+        self.assertEqual(len(iterations), 3)
+        for axis_g, magnitude_g in iterations:
+            self.assertAlmostEqual(axis_g, 1.4)
+            self.assertEqual(magnitude_g, session["metric_selection"]["magnitude_peak_g"])
+        self.assertTrue(any("per stroke 1.4/3.4 g, 1.4/3.4 g, 1.4/3.4 g" in line for line in rig.output))
+        self.assertTrue(session["beta_motion_iterations"])
+        self.assertTrue(all("capture" not in item for item in session["beta_motion_iterations"]))
 
     def test_moving_seed_replaces_higher_stationary_seed(self):
         rig = NoiseRig(noise=(3.1, 1.4))
@@ -81,6 +110,80 @@ class SelectedAxisCalibrationTests(unittest.TestCase):
         self.assertEqual(session["impact_metric"], "selected_axis")
         self.assertEqual(session["start_threshold_g"], 1.75)
         self.assertEqual(rig.home_calls[0]["threshold"], 1.75)
+        seed = session["motion_noise_seed"]
+        self.assertAlmostEqual(seed["peak_g"], 1.4)
+        self.assertEqual((seed["impact_metric"], seed["start_threshold_g"], seed["replaced"]),
+                         ("selected_axis", 1.75, "stationary_noise"))
+        md = json.loads(rig.configfile.saved[(MODEL, "y_metadata")])
+        self.assertEqual(md["motion_noise_seed"]["start_threshold_g"], 1.75)
+        self.assertEqual(md["stationary_noise_seed"]["superseded_by"], "motion_noise_seed")
+
+    def recovery_rig(self, source_metric):
+        """Run calibration as an accuracy-recovery recalibration would."""
+        rig = NoiseRig(noise=(3.1, 1.4))
+        rig.home_results.extend([{"impact_metric": "selected_axis"}] * 11)
+        run = rig.workflow._run_calibration
+        def recovering():
+            rig.workflow.session.update(accuracy_recovery={"source_impact_metric": source_metric},
+                                        source_accuracy={})
+            return run()
+        rig.workflow._run_calibration = recovering
+        return rig
+
+    def test_recovery_start_from_other_metric_uses_moving_seed(self):
+        rig = self.recovery_rig("xyz_magnitude")
+        rig.workflow.cmd_CALIBRATE(GCmd(AXIS="Y", CENTERED=1, SAVE_CONFIG=0, START_THRESHOLD=4.75))
+        session = rig.sessions[0]
+        self.assertEqual(session["impact_metric"], "selected_axis")
+        self.assertEqual(session["start_threshold_g"], 1.75)
+        self.assertEqual(rig.home_calls[0]["threshold"], 1.75)
+        self.assertEqual(session["motion_noise_seed"]["replaced"], "accuracy_recovery_start")
+        self.assertEqual(session["motion_noise_seed"]["replaced_start_threshold_g"], 4.75)
+        self.assertTrue(any("Accuracy-recovery start 4.75 g" in line for line in rig.output))
+
+    def test_explicit_start_far_above_selected_axis_noise_warns_but_is_kept(self):
+        for rig in (selected_rig([(1., 3.)]), self.recovery_rig("selected_axis")):
+            with self.subTest(recovery=rig.workflow._run_calibration.__name__):
+                rig.workflow.cmd_CALIBRATE(GCmd(AXIS="Y", CENTERED=1, SAVE_CONFIG=0,
+                                                START_THRESHOLD=4.75))
+                self.assertEqual(rig.home_calls[0]["threshold"], 4.75)
+                self.assertNotIn("motion_noise_seed", rig.sessions[0])
+                self.assertTrue(any("WARNING: START_THRESHOLD 4.75 g" in line for line in rig.output))
+
+    def test_selected_axis_early_capture_restarts_at_next_candidate(self):
+        rig = selected_rig([(1., 3.)])
+        rig.home_results.appendleft({"travel_mm": 8., "impact_metric": "selected_axis", "onset_g": 1.2})
+        rig.workflow.cmd_CALIBRATE(GCmd(AXIS="Y", CENTERED=1, SAVE_CONFIG=0))
+        self.assertEqual([call["threshold"] for call in rig.home_calls[:2]], [1.75, 2.])
+        early = rig.sessions[0]["records"][0]
+        self.assertTrue(early["early_capture_valid"])
+        self.assertEqual(rig.workflow.last_result["result"], "calibrated")
+
+    def test_selected_axis_early_capture_from_other_detector_aborts(self):
+        rig = selected_rig([(1., 3.)])
+        rig.home_results.appendleft({"travel_mm": 8., "impact_metric": "selected_axis", "onset_g": 1.2})
+        stop = rig.owner.stop_capture
+        def other_detector():
+            capture = stop()
+            capture["detector"]["impact_metric"] = "xyz_magnitude"
+            return capture
+        rig.owner.stop_capture = other_detector
+        with self.assertRaisesRegex(CommandError, "early return requires the current selected-axis"):
+            rig.workflow.cmd_CALIBRATE(GCmd(AXIS="Y", CENTERED=1, SAVE_CONFIG=0))
+        self.assertEqual(len(rig.home_calls), 1)
+
+    def test_selected_axis_home_without_onset_time_reports_missing_impact(self):
+        rig = selected_rig([(1., 3.)])
+        stop = rig.owner.stop_capture
+        def no_onset():
+            capture = stop()
+            capture["detector"]["onset_time_s"] = None
+            return capture
+        rig.owner.stop_capture = no_onset
+        with self.assertRaisesRegex(CommandError, "lacks the current measured impact "
+                                                  r"\(selected-axis capture has no retained arm/onset"):
+            rig.workflow.cmd_CALIBRATE(GCmd(AXIS="Y", CENTERED=1, SAVE_CONFIG=0))
+        self.assertEqual(rig.configfile.saved, {})
 
     def test_axis_dominated_noise_keeps_magnitude(self):
         rig = NoiseRig(noise=(3.1, .4))
@@ -100,7 +203,9 @@ class SelectedAxisCalibrationTests(unittest.TestCase):
         self.assertEqual(session["impact_metric"], "xyz_magnitude")
         self.assertEqual(session["metric_selection"]["source"], "skipped")
         self.assertIn("trapq extractor", session["metric_selection"]["reason"])
-        self.assertTrue(any("cross-axis" in line for line in rig.output))
+        self.assertNotIn("Beta", session["metric_selection"]["reason"])
+        self.assertTrue(any("cross-axis noise check skipped: moving-noise pre-pass requires" in line
+                            for line in rig.output))
         self.assertEqual(rig.central_moves(), [])
         self.assertTrue(rig.home_calls)
 
@@ -197,8 +302,36 @@ class SelectedAxisModelTests(unittest.TestCase):
         self.assertAlmostEqual(md["selected_axis_window"]["noise_max_g"], 1.43)
         self.assertAlmostEqual(md["selected_axis_window"]["impact_min_g"], 2.21)
         self.assertAlmostEqual(md["selected_axis_window"]["window_g"], .78)
+        self.assertEqual(md["selected_axis_window"]["noise_max_source"], "validation")
         self.assertAlmostEqual(rig.workflow.last_result["saved_threshold_g"], 1.82)
         self.assertTrue(any("window midpoint" in line for line in rig.output))
+        self.assertTrue(md["calibration_quiet_range_enforced"])
+
+    def test_selected_axis_model_records_both_metrics_margins(self):
+        rig = self.calibrated_y()
+        md = json.loads(rig.configfile.saved[(MODEL, "y_metadata")])
+        self.assertAlmostEqual(max(md["magnitude_noise_peak_g"]), math.hypot(1.43, 3.1))
+        self.assertAlmostEqual(min(md["magnitude_impact_peak_g"]), 2.21)
+        margins = next(line for line in rig.output if "margins vs staged" in line)
+        self.assertIn("homing-axis noise max 1.43 g", margins)
+        self.assertIn("XYZ magnitude noise max 3.414 g", margins)
+
+    def test_prepass_axis_peak_raises_noise_max(self):
+        rig = selected_rig([(1., 3.), (1., 2.21)])
+        rig.workflow.cmd_CALIBRATE(GCmd(AXIS="Y", CENTERED=1, SAVE_CONFIG=0))
+        md = json.loads(rig.configfile.saved[(MODEL, "y_metadata")])
+        self.assertEqual(md["selected_axis_window"]["noise_max_source"], "moving_noise")
+        self.assertAlmostEqual(md["selected_axis_window"]["noise_max_g"], 1.4)
+        self.assertAlmostEqual(float(rig.configfile.saved[(MODEL, "y_threshold")]), 1.805)
+
+    def test_early_trigger_onset_raises_noise_max(self):
+        rig = selected_rig([(1., 3.)])
+        rig.home_results.appendleft({"travel_mm": 8., "impact_metric": "selected_axis", "onset_g": 1.9})
+        rig.workflow.cmd_CALIBRATE(GCmd(AXIS="Y", CENTERED=1, SAVE_CONFIG=0))
+        md = json.loads(rig.configfile.saved[(MODEL, "y_metadata")])
+        self.assertEqual(md["selected_axis_window"]["noise_max_source"], "early_trigger")
+        self.assertAlmostEqual(md["selected_axis_window"]["noise_max_g"], 1.9)
+        self.assertAlmostEqual(float(rig.configfile.saved[(MODEL, "y_threshold")]), 2.45)
 
     def test_narrow_window_refuses_to_save(self):
         rig = selected_rig([(1.8, 3.), (1., 2.1)])
@@ -207,6 +340,8 @@ class SelectedAxisModelTests(unittest.TestCase):
         message = str(raised.exception)
         for number in ("1.800", "2.100", "0.300", "0.500"):
             self.assertIn(number, message)
+        self.assertIn("y_threshold", message)
+        self.assertIn("mechanics", message)
         self.assertEqual(rig.configfile.saved, {})
 
     def test_saved_selected_axis_model_routes_to_selected_detector_on_ordinary_home(self):
@@ -238,6 +373,11 @@ class SelectedAxisModelTests(unittest.TestCase):
         self.assertEqual(md["threshold_rule"], "tested_plus_margin")
         self.assertEqual(md["threshold_margin_g"], .5)
         self.assertEqual(md["tested_threshold_g"], 1.)
+        self.assertEqual(md["metric_selection"]["source"], "skipped")
+        self.assertFalse(md["calibration_quiet_range_enforced"])
+        # Diagnostics never fail an XYZ calibration; unusable windows store None.
+        self.assertEqual(set(md["magnitude_noise_peak_g"]), {None})
+        self.assertTrue(any("XYZ magnitude n/a" in line for line in rig.output))
 
     def test_xyz_calibration_records_homing_axis_peaks_as_diagnostics(self):
         rig = NoiseRig(noise=(3.1, .4))
@@ -245,6 +385,7 @@ class SelectedAxisModelTests(unittest.TestCase):
         rig.workflow.cmd_CALIBRATE(GCmd(AXIS="X", CENTERED=1, SAVE_CONFIG=0))
         md = json.loads(rig.configfile.saved[(MODEL, "x_metadata")])
         self.assertEqual(md["impact_metric"], "xyz_magnitude")
+        self.assertEqual(md["metric_selection"]["source"], "moving_noise")
         self.assertEqual(set(md["axis_noise_peak_g"]), {.6})
         self.assertEqual(set(md["axis_impact_peak_g"]), {2.5})
         self.assertEqual(rig.configfile.saved[(MODEL, "x_threshold")],
