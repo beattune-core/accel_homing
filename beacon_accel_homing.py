@@ -60,6 +60,8 @@ NOISE_SESSION_RETRIES = 3  # shared by all requested stationary windows
 ENABLE_SETTLE = 0.25       # s, motors switched on before homing settle before the reading
 BASELINE_NOISE_RATIO = 0.20  # all-axis peak-to-peak / current impact threshold
 QUIET_REFERENCE_MAX_WAIT = 2.0  # s after the first ready reference (selected-axis detector)
+QUIET_DECAY_WINDOW = 0.3     # s; steady noise: the reference range stopped shrinking over this
+QUIET_DECAY_FRACTION = 0.1   # minimum relative range decrease that still counts as decaying
 NATIVE_BASELINE_NOISE_FLOOR = 0.5  # g peak-to-peak, also capped by the impact threshold
 NATIVE_PROOF_HISTORY_SAMPLES = 4096  # bounded startup history, never silently evicted
 NATIVE_PROOF_SCAN_BUDGET = 1024      # same-window comparisons per reactor event
@@ -541,9 +543,9 @@ class BeaconAccelHoming:
                             for a in AXES}
         self.homing_accel = config.getfloat("homing_accel", 5000.0, minval=0.0)
         shared_back_off = config.getfloat("back_off_dist", 5.0, minval=0.0)
-        # z is present for symmetry with the other per-axis maps; only x/y are used.
         self.back_off_dist = {a: config.getfloat("%s_back_off_dist" % a, shared_back_off,
-                                                 minval=0.0) for a in ("x", "y", "z")}
+                                                 minval=0.0) for a in AXES}
+        self.quiet_notes = set()  # axes whose quiet-reference fallback was shown on the console
         self.baseline_batches = config.getint("baseline_batches", 25, minval=10, maxval=200)
         self.baseline_time = config.getfloat("baseline_time", 0.1, minval=0.05, maxval=1.0)
         self.baseline_noise_floor = config.getfloat("baseline_noise_floor", 0.7,
@@ -1207,7 +1209,7 @@ class BeaconAccelHoming:
                                        self._reference_noise_limit(axis) / count_g,
                                        threshold_g=self.threshold_g[axis],
                                        require_quiet=self._reference_requires_quiet(axis))
-            first_ready = None
+            first_ready, ranges, settled_range = None, collections.deque(), None
             with self.lock:
                 self.recent.clear()
                 self.tail = None
@@ -1229,16 +1231,29 @@ class BeaconAccelHoming:
                     ready = reference.baseline() is not None
                     last = reference.last
                 sensor_now = self.main_mcu.estimated_print_time(now)
+                if not ready:
+                    ranges.clear()
+                    settled_range = None
                 if (ready and last is not None and self._sample_time_valid(sensor_now, last)
                         and self._reference_receiving(reference, now)):
                     with self.lock:
                         quiet = (not reference.require_quiet
                                  or self._reference_quiet_for_proof(reference, axis))
+                        window_range = max(high - low for low, high in zip(reference.low, reference.high))
                     if first_ready is None:
                         first_ready = now
                     waited = now - first_ready
-                    if quiet or waited > QUIET_REFERENCE_MAX_WAIT:
+                    # Ranges older than the decay window, folded to their minimum.
+                    ranges.append((now, window_range))
+                    while ranges and ranges[0][0] <= now - QUIET_DECAY_WINDOW:
+                        older = ranges.popleft()[1]
+                        settled_range = older if settled_range is None else min(settled_range, older)
+                    stalled = (settled_range is not None
+                               and window_range > (1.0 - QUIET_DECAY_FRACTION) * settled_range)
+                    if quiet or stalled or waited > QUIET_REFERENCE_MAX_WAIT:
                         self._remember_reference(reference, sensor_now, "acquisition", "ready")
+                        self.baseline_status.update(quiet_wait_s=round(waited, 3),
+                                                    quiet_fallback=not quiet)
                         if not quiet:
                             self._note_not_quiet(reference, axis, waited)
                         return
@@ -1246,10 +1261,12 @@ class BeaconAccelHoming:
                     # the startup motion proof (for example after re-enabled
                     # motors snap into position). The ready window keeps
                     # sliding over the newest baseline_time of samples, so it
-                    # turns quiet once ringing decays; otherwise fall back to
-                    # its noise-bounded proof after the maximum wait. If
-                    # above-floor noise later resets the window, the normal
-                    # acquisition timeout counts from its last ready moment.
+                    # turns quiet once ringing decays. Steady noise, whose
+                    # range stopped shrinking over QUIET_DECAY_WINDOW, and
+                    # anything still not quiet after the maximum wait fall
+                    # back to the noise-bounded proof. If above-floor noise
+                    # later resets the window, the normal acquisition timeout
+                    # counts from its last ready moment.
                     started = now
                 if now - started > self.baseline_time + STREAM_START_TIMEOUT:
                     raise self._baseline_error(reference, sensor_now, "acquisition", "acquisition_timeout")
@@ -1275,6 +1292,9 @@ class BeaconAccelHoming:
             self.baseline_status = {
                 "axis": axis, "phase": phase, "result": result,
                 "quiet_range_enforced": reference is None or reference.require_quiet,
+                # Set on a ready reference: seconds waited for quietness, and
+                # whether it fell back to the noise-bounded reference.
+                "quiet_wait_s": None, "quiet_fallback": None,
                 "motion_proof_noise_bound_g": None if proof_noise is None else mapped(proof_noise),
                 "quiet_samples": 0 if reference is None else reference.count,
                 "quiet_span_ms": round(span * 1000.0, 3),
@@ -1309,8 +1329,8 @@ class BeaconAccelHoming:
         count_g = self.session_scale["scale"] / 1000.0
         mapping = ([(0, 1), (1, 1), (2, 1)] if self.backend is not None
                    else self.helper.config.axes_map)
-        return {name: round(values[index] * count_g, 6)
-                for name, (index, sign) in zip(("x", "y", "z"), mapping)}
+        return {name: round(values[pair[0]] * count_g, 6)
+                for name, pair in zip(("x", "y", "z"), mapping)}
 
     def _baseline_error(self, reference, sensor_now, phase, result, axis=None):
         self._remember_reference(reference, sensor_now, phase, result, axis)
@@ -1330,9 +1350,12 @@ class BeaconAccelHoming:
                    % (waited, peak["x"], peak["y"], peak["z"],
                       BASELINE_NOISE_RATIO * self.threshold_g[axis]))
         logging.info(message)
+        if axis in self.quiet_notes:
+            return  # Console once per axis per Klipper session; the log keeps every pass.
         respond = getattr(self.printer.lookup_object("gcode", None), "respond_info", None)
         if respond is not None:
-            respond(message)
+            self.quiet_notes.add(axis)
+            respond(message + " (shown once per axis; later passes are logged only)")
 
     def _uses_vector_detector(self, axis):
         return self.workflows.simple_detection(axis)
@@ -3647,11 +3670,17 @@ class BeaconAccelHoming:
         kind = "beacon_raw" if self.backend is None else self.backend.kind
         gcmd.respond_info("accel_homing: sensor %s, backend %s, X %.12g g, Y %.12g g"
                           % (self.sensor_name, kind, self.threshold_g["x"], self.threshold_g["y"]))
+        gcmd.respond_info("accel_homing: back-off X %.12g mm, Y %.12g mm"
+                          " (final and cross-axis release; 0 disables)"
+                          % (self.back_off_dist["x"], self.back_off_dist["y"]))
         gcmd.respond_info("accel_homing: baseline policy: legacy ordinary homing requires quiet XYZ;"
-                          " simple calibration and saved XYZ-magnitude models require a post-settle"
+                          " XYZ-magnitude calibration and saved XYZ-magnitude models require a post-settle"
                           " %.2f ms / %d sample reference without a quiet-range limit;"
-                          " no acceleration-derived motion proof for XYZ magnitude"
-                          % (self.baseline_time * 1000.0, BASELINE_MIN_SAMPLES))
+                          " no acceleration-derived motion proof for XYZ magnitude;"
+                          " selected-axis calibration and saved selected-axis models wait up to"
+                          " %.1f s for a quiet reference (less once the noise stops decaying),"
+                          " then continue with a noise-bounded reference"
+                          % (self.baseline_time * 1000.0, BASELINE_MIN_SAMPLES, QUIET_REFERENCE_MAX_WAIT))
         if self.backend is not None:
             mapping = getattr(self.backend.sensor, "axes_map", None)
             gcmd.respond_info("accel_homing: axes_map applied by the sensor driver before samples reach the plugin: %s"

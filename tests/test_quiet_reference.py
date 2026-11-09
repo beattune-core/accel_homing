@@ -1,4 +1,5 @@
 """Exact rolling pre-arm references; all traces are synthetic, not printer data."""
+import math
 import random
 import types
 import unittest
@@ -237,11 +238,12 @@ class QuietReferenceTest(unittest.TestCase):
 
 
 class RollingReferenceIntegrationTest(unittest.TestCase):
-    def machine(self, legacy=False, threshold=0.5, ringing=None, settled=0.02):
+    def machine(self, legacy=False, threshold=0.5, ringing=None, settled=0.02, decay=None):
         """Without ``ringing`` an old -0.68 g extremum conflicts with a later
         +0.06 g step (quiet within 0.2 x threshold once the extremum is dropped);
         with ``ringing``, X first rings at +/-0.22 g (0.44 g p-p) for ``ringing`` s,
-        then alternates at +/-``settled`` g."""
+        then alternates at +/-``settled`` g. With ``decay``, X rings at
+        +/-0.3 g * exp(-t / decay) (0.6 g p-p, below the 0.7 g floor)."""
         obj = generic(legacy=legacy, connect=False)
         obj.fake_printer.send_event("klippy:connect")
         obj.threshold_g["x"] = threshold
@@ -257,7 +259,9 @@ class RollingReferenceIntegrationTest(unittest.TestCase):
             for offset in range(16):
                 index = number[0] + offset
                 when = origin[0] + (index + 1) / 3200.0
-                if ringing is None:
+                if decay is not None:
+                    x = 0.3 * math.exp(-(when - origin[0]) / decay) * (1 if index % 2 else -1)
+                elif ringing is None:
                     x = -0.68 if index == 0 else 0.06 if index >= 215 else 0.0
                 else:
                     x = (0.22 if when - origin[0] < ringing else settled) * (1 if index % 2 else -1)
@@ -342,6 +346,8 @@ class RollingReferenceIntegrationTest(unittest.TestCase):
         self.prepare(obj, endstop)
         reference = obj.preparation
         self.assertEqual(obj.baseline_status["result"], "ready")
+        self.assertFalse(obj.baseline_status["quiet_fallback"])
+        self.assertGreater(obj.baseline_status["quiet_wait_s"], 0.3)
         self.assertGreaterEqual(reference.first - obj.stream_origin[0], 0.5)
         self.assertGreater(obj.reactor.now - started, obj.baseline_time + 0.5)
         self.assertEqual(endstop._dispatch.started, [])
@@ -349,21 +355,24 @@ class RollingReferenceIntegrationTest(unittest.TestCase):
         self.assertIsNone(attempt.proof_noise)
         return reference
 
-    def test_selected_axis_waits_for_quiet_reference(self):
-        obj, endstop = self.machine(threshold=1.9, ringing=0.5)
+    def test_selected_axis_waits_for_decaying_ringing_to_turn_quiet(self):
+        obj, endstop = self.machine(threshold=1.9, decay=1.2)
         reference = self.ringing_home(obj, endstop)
         self.assertTrue(reference.require_quiet)
 
-    def test_selected_axis_never_quiet_falls_back_to_noise_bounded_reference(self):
-        obj, endstop = self.machine(threshold=1.9, ringing=3.0)
+    def test_selected_axis_steady_noise_falls_back_early_with_one_note(self):
+        obj, endstop = self.machine(threshold=1.9, ringing=10.0)
         notes = []
         obj.fake_printer.objects["gcode"].respond_info = notes.append
-        started = obj.reactor.now
-        self.prepare(obj, endstop)
-        self.assertEqual(obj.baseline_status["result"], "ready")
-        self.assertGreater(obj.reactor.now - started, plugin.QUIET_REFERENCE_MAX_WAIT)
+        for _home in range(2):
+            started = obj.reactor.now
+            self.prepare(obj, endstop)
+            self.assertEqual(obj.baseline_status["result"], "ready")
+            self.assertLess(obj.reactor.now - started, 1.0)
+            self.assertTrue(obj.baseline_status["quiet_fallback"])
+            self.assertLess(obj.baseline_status["quiet_wait_s"], 1.0)
         self.assertEqual(len(notes), 1)
-        self.assertRegex(notes[0], r"not quiet after 2\.\d s \(range x 0\.440"
+        self.assertRegex(notes[0], r"not quiet after 0\.\d s \(range x 0\.440"
                                    r" / y 0\.000 / z 0\.000 g, limit 0\.380 g\);"
                                    r" continuing with noise-bounded reference")
         self.assertEqual(endstop._dispatch.started, [])
@@ -393,7 +402,7 @@ class RollingReferenceIntegrationTest(unittest.TestCase):
         self.assertLessEqual(obj.reactor.now - started, obj.baseline_time + 0.010)
 
     def test_selected_axis_calibration_home_uses_quiet_rule(self):
-        obj, endstop = self.machine(threshold=1.9, ringing=0.5)
+        obj, endstop = self.machine(threshold=1.9, decay=1.2)
         w = obj.workflows
         w.session = {"mode": "calibration", "state": "running", "axis": "x",
                      "algorithm": "impact20_vector_v2", "impact_metric": "selected_axis"}
