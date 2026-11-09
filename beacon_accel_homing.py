@@ -105,8 +105,11 @@ class QuietReference:
     """Bounded contiguous reference, optionally quiet, protected by the owner lock."""
 
     def __init__(self, axis, cutoff, duration, limit, threshold_g=None,
-                 require_quiet=True):
+                 require_quiet=True, judged=None):
         self.axis, self.cutoff, self.duration, self.limit = axis, cutoff, duration, limit
+        # Raw sensor indices the quiet limit applies to (None: all three). A
+        # selected-axis detector only reads the homing-axis component.
+        self.judged = (0, 1, 2) if judged is None else tuple(judged)
         self.threshold_g = threshold_g
         self.require_quiet = require_quiet
         self.first = self.last = None
@@ -146,14 +149,12 @@ class QuietReference:
                 maximum.pop()
             minimum.append((self.accepted, value))
             maximum.append((self.accepted, value))
-        if self.require_quiet and any(high[0][1] - low[0][1] > self.limit
-                                      for low, high in zip(self._minimum, self._maximum)):
+        if self.require_quiet and self._noisy():
             # Keep the longest contiguous suffix that is quiet on every axis.
             # Resetting to only the new sample would discard valid overlapping
             # windows whenever an old extremum is the sole offending sample.
             self.resets += 1
-            while any(high[0][1] - low[0][1] > self.limit
-                      for low, high in zip(self._minimum, self._maximum)):
+            while self._noisy():
                 self._drop_first()
         # History older than a complete qualifying window is redundant. Keep
         # its boundary sample: dropping it must still leave both the minimum
@@ -181,6 +182,10 @@ class QuietReference:
         if (span, self.count) > (self.best_span, self.best_count):
             self.best_count, self.best_span = self.count, span
             self.best_peak_to_peak = tuple(b - a for a, b in zip(self.low, self.high))
+
+    def _noisy(self):
+        return any(self._maximum[i][0][1] - self._minimum[i][0][1] > self.limit
+                   for i in self.judged)
 
     def _drop_first(self):
         number, _when, values = self._samples.popleft()
@@ -321,7 +326,9 @@ def describe_reference(status):
     def age(value):
         return "unknown" if value is None else "%.2f" % value
     require_quiet = status.get("quiet_range_enforced", True)
-    limit = ("limit %.3f g" % status["quiet_limit_g"] if require_quiet else
+    limit = ("limit %.3f g%s" % (status["quiet_limit_g"],
+                 ", judged on %s only" % status["judged_axis"].upper()
+                 if status.get("judged_axis") else "") if require_quiet else
              "quiet range not required for calibration")
     age_policy = ("past-age limit disabled" if status["max_sample_age_ms"] is None else
                   "max %.2f ms" % status["max_sample_age_ms"])
@@ -414,6 +421,7 @@ class Attempt:
         self.signal_packet = None
         self.reference_signal_quality = None
         self.vector_unchanged_since = None
+        self.proof_axes = (0, 1, 2)  # raw sensor indices the motion proof integrates
         self.proof_noise = None    # measured uncertainty for calibration/expanded references
         self.proof_state = None    # atomic (sums, sample count, dt, end clock) for that proof
         self.proof_speed_peak = 0.0  # conservative lower bound, before the startup deadline
@@ -1208,7 +1216,8 @@ class BeaconAccelHoming:
             reference = QuietReference(axis, cutoff, self.baseline_time,
                                        self._reference_noise_limit(axis) / count_g,
                                        threshold_g=self.threshold_g[axis],
-                                       require_quiet=self._reference_requires_quiet(axis))
+                                       require_quiet=self._reference_requires_quiet(axis),
+                                       judged=self._judged_components(axis))
             first_ready, ranges, settled_range = None, collections.deque(), None
             with self.lock:
                 self.recent.clear()
@@ -1239,7 +1248,8 @@ class BeaconAccelHoming:
                     with self.lock:
                         quiet = (not reference.require_quiet
                                  or self._reference_quiet_for_proof(reference, axis))
-                        window_range = max(high - low for low, high in zip(reference.low, reference.high))
+                        window_range = max(reference.high[i] - reference.low[i]
+                                           for i in reference.judged)
                     if first_ready is None:
                         first_ready = now
                     waited = now - first_ready
@@ -1292,6 +1302,10 @@ class BeaconAccelHoming:
             self.baseline_status = {
                 "axis": axis, "phase": phase, "result": result,
                 "quiet_range_enforced": reference is None or reference.require_quiet,
+                # Machine axis the quiet rules were judged on (None: all of XYZ).
+                "judged_axis": (None if self._uses_vector_detector(axis)
+                                or (reference is not None and not reference.require_quiet)
+                                else axis),
                 # Set on a ready reference: seconds waited for quietness, and
                 # whether it fell back to the noise-bounded reference.
                 "quiet_wait_s": None, "quiet_fallback": None,
@@ -1346,9 +1360,9 @@ class BeaconAccelHoming:
         with self.lock:
             peak = self._mapped_g(tuple(high - low for low, high in zip(reference.low, reference.high)))
         message = ("accel_homing: standstill reference not quiet after %.1f s (range x %.3f / y %.3f"
-                   " / z %.3f g, limit %.3f g); continuing with noise-bounded reference"
+                   " / z %.3f g, limit %.3f g, judged on %s only); continuing with noise-bounded reference"
                    % (waited, peak["x"], peak["y"], peak["z"],
-                      BASELINE_NOISE_RATIO * self.threshold_g[axis]))
+                      BASELINE_NOISE_RATIO * self.threshold_g[axis], axis.upper()))
         logging.info(message)
         if axis in self.quiet_notes:
             return  # Console once per axis per Klipper session; the log keeps every pass.
@@ -1359,6 +1373,16 @@ class BeaconAccelHoming:
 
     def _uses_vector_detector(self, axis):
         return self.workflows.simple_detection(axis)
+
+    def _judged_components(self, axis):
+        """Raw sensor indices a reference is judged on: the detector's own component.
+
+        The selected-axis detector reads only the homing-axis mapped component,
+        so cross-axis ringing must not fail its reference. XYZ-magnitude
+        references keep all three."""
+        if self._uses_vector_detector(axis):
+            return None
+        return (self._raw_axis(axis)[0],)
 
     def _reference_requires_quiet(self, axis):
         """Quiet gate (and quiet wait) for the selected-axis detector only."""
@@ -1372,7 +1396,7 @@ class BeaconAccelHoming:
     def _reference_quiet_for_proof(self, reference, axis):
         """Every axis range within the impact-relative limit (no proof noise bound)."""
         original = BASELINE_NOISE_RATIO * self.threshold_g[axis] / (self.session_scale["scale"] / 1000.0)
-        return all(high - low <= original for low, high in zip(reference.low, reference.high))
+        return all(reference.high[i] - reference.low[i] <= original for i in reference.judged)
 
     def _reference_noise_limit(self, axis):
         original = BASELINE_NOISE_RATIO * self.threshold_g[axis]
@@ -1606,6 +1630,8 @@ class BeaconAccelHoming:
                           deadline, beacon_mcu.print_time_to_clock(deadline) & 0xFFFFFFFF,
                           index, map_sign, direction, limit_raw, count_g)
         attempt.vector_mode = vector_mode
+        if not vector_mode:
+            attempt.proof_axes = (index,)
         reference_quality = self._signal_quality("stationary_reference", count_g)
         for observation in reference._observations:
             if observation is not None:
@@ -1720,16 +1746,16 @@ class BeaconAccelHoming:
         sums, dt = ((attempt.sums, attempt.sample_dt) if proof_state is None else
                     (proof_state[0], proof_state[2]))
         scale = attempt.count_g * MM_PER_S2_PER_G * dt
-        return sum((v * scale) ** 2 for v in sums) ** 0.5
+        return sum((sums[i] * scale) ** 2 for i in attempt.proof_axes) ** 0.5
 
     def _motion_speed_bounds(self, attempt, proof_state):
         """Integrated speed bounds if disturbance stays within the pre-arm envelope."""
         sums, integrated_count, dt, _end_clock = proof_state
         scale = attempt.count_g * MM_PER_S2_PER_G * dt
-        lower = sum((max(0.0, abs(value) - bound * integrated_count) * scale) ** 2
-                    for value, bound in zip(sums, attempt.proof_noise)) ** 0.5
-        upper = sum(((abs(value) + bound * integrated_count) * scale) ** 2
-                    for value, bound in zip(sums, attempt.proof_noise)) ** 0.5
+        lower = sum((max(0.0, abs(sums[i]) - attempt.proof_noise[i] * integrated_count) * scale) ** 2
+                    for i in attempt.proof_axes) ** 0.5
+        upper = sum(((abs(sums[i]) + attempt.proof_noise[i] * integrated_count) * scale) ** 2
+                    for i in attempt.proof_axes) ** 0.5
         return lower, upper
 
     def _append_motion_history(self, attempt, raw, count, start_clock, interval):
@@ -1824,7 +1850,7 @@ class BeaconAccelHoming:
                     break
                 number = end_count - start_count
                 lower_squared = 0.0
-                for axis in range(3):
+                for axis in attempt.proof_axes:
                     lower = max(0.0, abs(end_sums[axis] - start_sums[axis]) - bounds[axis] * number)
                     lower_squared += (lower * scale) ** 2
                 lower = lower_squared ** 0.5

@@ -56,6 +56,10 @@ fresh reference. Preparation can time out if no usable window arrives.
 Simple vector references estimate only a fresh resting offset; the quiet gates
 below do not apply to them. They still need valid, fresh, contiguous data.
 
+Selected-axis homes judge the quiet limit, the acquisition floor and the motion-proof
+noise bound on the homing-axis component only (the one the detector reads, after
+`axes_map`); other axes are still reported in diagnostics.
+
 For the **generic legacy detector**, each sensor axis's stationary peak-to-peak
 limit is:
 

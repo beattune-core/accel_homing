@@ -971,6 +971,12 @@ class NativeExpandedReferenceTests(unittest.TestCase):
                                      for index, value in enumerate(previous_low))
                     self.high = tuple(34 if index == axis else value
                                       for index, value in enumerate(previous_high))
+                    if axis != 0:
+                        # Only the homing (x) component is judged for this home.
+                        obj, _endstop = self.machine()
+                        self.assertIsNotNone(obj.baseline_status)
+                        self.assertEqual(obj.baseline_status["quiet_resets"], 0)
+                        continue
                     with self.assertRaisesRegex(CommandError, "fresh quiet"):
                         self.machine()
                 finally:
@@ -1166,7 +1172,7 @@ class NativeExpandedReferenceTests(unittest.TestCase):
     def test_current_upper_bound_preserves_justified_expanded_native_pressed_start(self):
         previous_low, previous_high = self.low, self.high
         try:
-            self.low, self.high = (0, 0, 121), (1, 0, 135)
+            self.low, self.high = (121, 0, 0), (135, 1, 0)
             obj, endstop = self.machine(speed=100.0)
             attempt = self.prepare(obj, endstop)
             self.assertIsNotNone(attempt.proof_noise)

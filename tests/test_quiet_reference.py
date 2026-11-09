@@ -238,12 +238,14 @@ class QuietReferenceTest(unittest.TestCase):
 
 
 class RollingReferenceIntegrationTest(unittest.TestCase):
-    def machine(self, legacy=False, threshold=0.5, ringing=None, settled=0.02, decay=None):
+    def machine(self, legacy=False, threshold=0.5, ringing=None, settled=0.02, decay=None,
+                cross=0.0, cross_axis=1):
         """Without ``ringing`` an old -0.68 g extremum conflicts with a later
         +0.06 g step (quiet within 0.2 x threshold once the extremum is dropped);
         with ``ringing``, X first rings at +/-0.22 g (0.44 g p-p) for ``ringing`` s,
         then alternates at +/-``settled`` g. With ``decay``, X rings at
-        +/-0.3 g * exp(-t / decay) (0.6 g p-p, below the 0.7 g floor)."""
+        +/-0.3 g * exp(-t / decay) (0.6 g p-p, below the 0.7 g floor). ``cross`` rings the
+        other axis ``cross_axis`` (1 = y, 2 = z) at +/-``cross`` g throughout."""
         obj = generic(legacy=legacy, connect=False)
         obj.fake_printer.send_event("klippy:connect")
         obj.threshold_g["x"] = threshold
@@ -265,7 +267,9 @@ class RollingReferenceIntegrationTest(unittest.TestCase):
                     x = -0.68 if index == 0 else 0.06 if index >= 215 else 0.0
                 else:
                     x = (0.22 if when - origin[0] < ringing else settled) * (1 if index % 2 else -1)
-                rows.append((when, x * G, 0.0, G))
+                other = cross * (1 if index % 2 else -1)
+                rows.append((when, x * G, other * G if cross_axis == 1 else 0.0,
+                             G + (other * G if cross_axis == 2 else 0.0)))
             number[0] += 16
             obj.backend.helper.emit({"data": rows})
         obj.reactor.on_pause = flow
@@ -391,8 +395,8 @@ class RollingReferenceIntegrationTest(unittest.TestCase):
             self.assertLess(obj.baseline_status["quiet_wait_s"], 1.0)
         self.assertEqual(len(notes), 1)
         self.assertRegex(notes[0], r"not quiet after 0\.\d s \(range x 0\.440"
-                                   r" / y 0\.000 / z 0\.000 g, limit 0\.380 g\);"
-                                   r" continuing with noise-bounded reference")
+                                   r" / y 0\.000 / z 0\.000 g, limit 0\.380 g")
+        self.assertIn("noise-bounded", notes[0])
         self.assertEqual(endstop._dispatch.started, [])
         attempt = obj.prepare(endstop, obj.backend.last_sample_time + 1 / 3200.0)
         self.assertIsNotNone(attempt.proof_noise)
@@ -427,6 +431,66 @@ class RollingReferenceIntegrationTest(unittest.TestCase):
         w.in_home, w.home_axis = True, "x"
         reference = self.ringing_home(obj, endstop)
         self.assertTrue(reference.require_quiet)
+
+    def test_selected_axis_cross_axis_ringing_does_not_fail_or_fall_back(self):
+        # x homes; y/z ring at 0.78 g p-p, above the 0.7 g floor and the quiet limit.
+        for cross_axis in (1, 2):
+            with self.subTest(cross_axis=cross_axis):
+                obj, endstop = self.machine(threshold=1.9, ringing=0.0, settled=0.0,
+                                            cross=0.39, cross_axis=cross_axis)
+                started = obj.reactor.now
+                self.prepare(obj, endstop)
+                status = obj.baseline_status
+                self.assertEqual(status["result"], "ready")
+                self.assertFalse(status["quiet_fallback"])
+                self.assertEqual(status["quiet_resets"], 0)
+                self.assertEqual(status["judged_axis"], "x")
+                self.assertLess(obj.reactor.now - started, 1.0)
+                # Cross-axis p-p stays reported.
+                self.assertAlmostEqual(status["observed_peak_to_peak_g"]["yz"[cross_axis - 1]], 0.78, places=2)
+                self.assertGreater(obj.preparation.high[cross_axis] - obj.preparation.low[cross_axis],
+                                   obj.preparation.limit)
+                attempt = obj.prepare(endstop, obj.backend.last_sample_time + 1 / 3200.0)
+                self.assertIsNone(attempt.proof_noise)
+                self.assertEqual(attempt.proof_axes, (0,))
+
+    def test_selected_axis_homing_component_above_floor_still_fails(self):
+        obj, endstop = self.machine(threshold=1.9, ringing=0.0, settled=0.4, cross=0.39)
+        with self.assertRaisesRegex(CommandError, "acquisition timeout"):
+            self.prepare(obj, endstop)
+        self.assertGreater(obj.baseline_status["quiet_resets"], 0)
+
+    def test_xyz_magnitude_reference_still_judges_every_component(self):
+        obj, endstop = self.machine(threshold=1.9, ringing=0.0, settled=0.0, cross=0.39)
+        w = obj.workflows
+        w.model = types.SimpleNamespace(thresholds={"x": 1.9},
+                                       metadata={"x": {"impact_metric": "xyz_magnitude"}})
+        w.manual_axes.clear()
+        self.prepare(obj, endstop)
+        self.assertFalse(obj.preparation.require_quiet)
+        self.assertEqual(obj.preparation.judged, (0, 1, 2))
+        self.assertIsNone(obj.baseline_status["judged_axis"])
+
+    def test_selected_axis_calibration_home_ignores_cross_axis_ringing(self):
+        obj, endstop = self.machine(threshold=1.9, ringing=0.0, settled=0.0, cross=0.39)
+        w = obj.workflows
+        w.session = {"mode": "calibration", "state": "running", "axis": "x",
+                     "algorithm": "impact20_vector_v2", "impact_metric": "selected_axis"}
+        w.in_home, w.home_axis = True, "x"
+        self.prepare(obj, endstop)
+        self.assertTrue(obj.preparation.require_quiet)
+        self.assertEqual(obj.preparation.judged, (0,))
+        self.assertEqual(obj.baseline_status["result"], "ready")
+        self.assertFalse(obj.baseline_status["quiet_fallback"])
+
+    def test_quiet_reference_judges_only_listed_components(self):
+        reference = plugin.QuietReference("x", -1.0, 0.1, 700.0, threshold_g=0.5, judged=(1,))
+        for number in range(400):
+            self.assertIsNone(reference.add(number / 3200.0,
+                                            (1500.0 * (number % 2), 10.0, 1000.0)))
+        self.assertEqual(reference.resets, 0)
+        self.assertIsNotNone(reference.baseline())
+        self.assertEqual(reference.high[0] - reference.low[0], 1500.0)
 
 
 if __name__ == "__main__":

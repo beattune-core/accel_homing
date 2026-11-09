@@ -624,6 +624,12 @@ class RaisedBaselineFloorTest(unittest.TestCase):
                 spreads = [0.581, 0.392, 0.258]
                 spreads[index] = 0.702
                 obj, endstop = self.machine(spreads=spreads)
+                if index != 0:
+                    # Selected-axis home on x: only the homing component is judged.
+                    obj._prepare_reference()
+                    self.assertIsNotNone(obj.preparation.baseline())
+                    self.assertEqual(obj.baseline_status["quiet_resets"], 0)
+                    continue
                 with self.assertRaisesRegex(CommandError, "acquisition timeout"):
                     obj._prepare_reference()
                 self.assertIsNone(obj.attempt)

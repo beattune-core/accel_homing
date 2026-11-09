@@ -560,6 +560,8 @@ class EnablePreparationTest(unittest.TestCase):
             for excursion, accepted in ((0.04, True), (0.06, True),
                                         (0.25, True), (0.26, False)):
                 with self.subTest(axis=axis, excursion_g=excursion):
+                    # The selected-axis (x) detector judges the homing component only.
+                    accepted = accepted or axis != 0
                     obj, endstop, _log, _lines = self.session()
                     plain = obj.reactor.on_pause
                     batches = [0]
@@ -708,6 +710,11 @@ class EnablePreparationTest(unittest.TestCase):
                                            [values] * 5, delta_clock=4,
                                            receive_time=obj.reactor.now))
                 obj.reactor.on_pause = flow
+                if mode == "z_noise":
+                    # Cross-axis noise is not judged for the selected-axis home on x.
+                    self.begin(obj, endstop)
+                    self.assertIsNotNone(obj.preparation.baseline())
+                    continue
                 with self.assertRaisesRegex(CommandError, "fresh quiet"):
                     self.begin(obj, endstop)
                 self.assert_unarmed_cleanup(obj, endstop)
