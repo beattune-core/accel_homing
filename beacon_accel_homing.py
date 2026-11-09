@@ -3653,6 +3653,13 @@ class BeaconAccelHoming:
                           " no acceleration-derived motion proof for XYZ magnitude"
                           % (self.baseline_time * 1000.0, BASELINE_MIN_SAMPLES))
         if self.backend is not None:
+            mapping = getattr(self.backend.sensor, "axes_map", None)
+            gcmd.respond_info("accel_homing: axes_map applied by the sensor driver before samples reach the plugin: %s"
+                              % (list(mapping) if mapping is not None else "unavailable"))
+        else:
+            gcmd.respond_info("accel_homing: accel_axes_map applied by the plugin to native Beacon samples: %s"
+                              % list(self.helper.config.axes_map))
+        if self.backend is not None:
             gcmd.respond_info("accel_homing: requested report interval %.4f s, past sample-age limit disabled;"
                               " configured max_sample_age %.4f s controls startup timing and nominal travel planning;"
                               " observed rate %s Hz, nominal report-travel speed ceiling %s;"

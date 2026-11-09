@@ -70,6 +70,40 @@ after measurement. Its reference and moving detector use receipt liveness,
 while cutoffs exclude earlier windows/pre-arm impacts. Native Beacon's age
 policy is unchanged. See [timing details](DETAILS.md#timing-and-optional-travel-policies).
 
+## Cross-axis noise and the selected-axis metric
+
+After the stationary windows, calibration runs a moving-noise pre-pass: Beta
+central strokes at the effective homing speed and acceleration, stopping short
+of the stop. When the homing-axis peak divided by the XYZ-magnitude peak is
+below 0.7, motion noise is mostly cross-axis and calibration uses the
+`selected_axis` metric; otherwise it keeps `xyz_magnitude`. Unless
+`START_THRESHOLD` is given, the start is seeded from the chosen metric's moving
+peak: the largest of the configured start, 1.2 x peak and peak + 0.1 g, on the
+grid. Accuracy-recovery recalibration also runs the pre-pass, with its explicit
+start.
+
+If the pre-pass cannot run (no motion_report trapq extractor, stroke too short,
+unmatched homing current), calibration warns `cross-axis noise check skipped:
+...; calibrating with XYZ magnitude` and continues. A cancel or fault during
+the pre-pass aborts calibration.
+
+A selected-axis model saves the midpoint between the highest pre-impact
+homing-axis noise peak and the weakest homing-axis impact peak over the ten
+checks (noise window: arm to 3 ms before onset; impact window: 30 ms after
+onset). A window narrower than 0.5 g is refused rather than saved. XYZ models
+still save the tested threshold plus 0.5 g. The model records
+`impact_metric`, `threshold_rule` (`window_midpoint` or `tested_plus_margin`),
+`selected_axis_window` and `metric_selection`. Ordinary homes with a saved
+selected-axis model use the selected-axis detector; explicit `x_threshold` /
+`y_threshold` still take precedence.
+
+For the selected-axis detector only, after motor enable the plugin waits up to
+2.0 s (at least `enable_settle_time`) for a standstill reference quiet enough
+that the motion proof needs no noise bound (range at most 0.2 x threshold per
+axis). Otherwise it continues with the noise-bounded reference and prints
+`standstill reference not quiet after ...` with the ranges and limit. Above-floor
+noise during the wait still fails.
+
 ## Threshold validity and homing attempts
 
 Calibration starts and saved model thresholds must be finite and at least

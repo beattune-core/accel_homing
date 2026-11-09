@@ -71,7 +71,13 @@ an 8 g MPU9250 sensor.
 To use calibration, comment out both axis overrides **and** the shared
 `threshold`, then issue console `RESTART` while idle. An explicit manual
 threshold retains the legacy selected-axis detector; a newly calibrated model
-uses XYZ magnitude. Values calibrated for one metric are not interchangeable
+uses XYZ magnitude, or the selected-axis metric when calibration's moving-noise
+pre-pass finds mostly cross-axis noise (see
+[cross-axis noise](SIMPLE_CALIBRATION.md#cross-axis-noise-and-the-selected-axis-metric)).
+`axes_map` is applied by the Klipper/Kalico driver for configured sensors
+(adxl345 etc.) before samples reach the plugin, and by `accel_axes_map` for
+native Beacon; `ACCEL_HOMING_STATUS` reports which applies. Calibration is not
+affected by either. Values calibrated for one metric are not interchangeable
 with the other. The detector in use is part of the model/status context.
 Both RAW metrics ignore acceleration polarity after subtracting their fresh
 signed reference; selected-axis detection uses `abs(a-b)`. Homing direction

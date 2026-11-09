@@ -26,6 +26,9 @@ python3 -B -m unittest discover -s tests -p 'test_accuracy_recovery.py' -v
 python3 -B -m unittest discover -s tests -p 'test_simple_calibration.py' -v
 python3 -B -m unittest discover -s tests -p 'test_calibration_margin.py' -v
 python3 -B -m unittest discover -s tests -p 'test_beta_calibration.py' -v
+python3 -B -m unittest discover -s tests -p 'test_back_off_per_axis.py' -v
+python3 -B -m unittest discover -s tests -p 'test_selected_axis_signal.py' -v
+python3 -B -m unittest discover -s tests -p 'test_selected_axis_calibration.py' -v
 python3 -B -m unittest discover -s tests -p 'test_noise_recovery.py' -v
 python3 -B -m unittest discover -s tests -p 'test_failed_chart_publication.py' -v
 python3 -B -m unittest discover -s tests -p 'test_absolute_charts.py' -v

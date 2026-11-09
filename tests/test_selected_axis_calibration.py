@@ -1,8 +1,10 @@
 """Calibration pre-pass selects the impact metric from moving cross-axis noise."""
 import json
 import math
+import types
 import unittest
 
+import test_manual_thresholds
 from harness import CommandError
 from test_beta_calibration import BetaRig
 from test_workflows import GCmd, Rig, workflow_module
@@ -247,6 +249,29 @@ class SelectedAxisModelTests(unittest.TestCase):
         self.assertEqual(set(md["axis_impact_peak_g"]), {2.5})
         self.assertEqual(rig.configfile.saved[(MODEL, "x_threshold")],
                          "%.17g" % (md["tested_threshold_g"] + .5))
+
+
+class StatusAxesMapTests(unittest.TestCase):
+    def status_lines(self, backend):
+        obj = test_manual_thresholds.ManualThresholdRangeTests().create(backend)
+        mapping = [(1, 1), (0, -1), (2, 1)]
+        if backend == "generic":
+            obj.backend.sensor.axes_map = mapping
+        else:
+            obj.helper.config.axes_map = mapping
+        messages = []
+        obj.cmd_STATUS(types.SimpleNamespace(respond_info=messages.append))
+        return [line for line in messages if "axes_map" in line]
+
+    def test_status_reports_axes_map_source(self):
+        lines = self.status_lines("generic")
+        self.assertEqual(len(lines), 1)
+        self.assertIn("axes_map applied by the sensor driver", lines[0])
+        self.assertIn("[(1, 1), (0, -1), (2, 1)]", lines[0])
+        lines = self.status_lines("beacon")
+        self.assertEqual(len(lines), 1)
+        self.assertIn("accel_axes_map", lines[0])
+        self.assertIn("[(1, 1), (0, -1), (2, 1)]", lines[0])
 
 
 if __name__ == "__main__":

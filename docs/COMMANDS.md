@@ -62,9 +62,13 @@ preparation after that restart before calibrating Y:
 ACCEL_HOMING_CALIBRATE AXIS=Y CENTERED=1
 ```
 
-The saved threshold is the candidate that passed ten checks **plus 0.5 g**,
+When calibration keeps the XYZ metric, the saved threshold is the candidate that passed ten checks **plus 0.5 g**,
 applied once after qualification. Those checks test the candidate; they do not
 test the higher saved value. The other axis is unchanged.
+
+Calibration first runs a moving-noise pre-pass and switches to the
+`selected_axis` metric (window-midpoint threshold) when noise is mostly
+cross-axis; see [cross-axis noise](SIMPLE_CALIBRATION.md#cross-axis-noise-and-the-selected-axis-metric).
 
 Both commands first measure fresh stationary noise. The default start grid is
 1 g with 0.25 g steps. `START_THRESHOLD` explicitly chooses the first candidate
