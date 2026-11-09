@@ -59,6 +59,7 @@ NOISE_WINDOW_RETRIES = 2   # fresh complete reacquisitions; stationary workflows
 NOISE_SESSION_RETRIES = 3  # shared by all requested stationary windows
 ENABLE_SETTLE = 0.25       # s, motors switched on before homing settle before the reading
 BASELINE_NOISE_RATIO = 0.20  # all-axis peak-to-peak / current impact threshold
+QUIET_REFERENCE_MAX_WAIT = 2.0  # s after the first ready reference (selected-axis detector)
 NATIVE_BASELINE_NOISE_FLOOR = 0.5  # g peak-to-peak, also capped by the impact threshold
 NATIVE_PROOF_HISTORY_SAMPLES = 4096  # bounded startup history, never silently evicted
 NATIVE_PROOF_SCAN_BUDGET = 1024      # same-window comparisons per reactor event
@@ -1202,11 +1203,13 @@ class BeaconAccelHoming:
             cutoff = self.main_mcu.estimated_print_time(started)
             axis = next(iter(self.session_axes))
             count_g = self.session_scale["scale"] / 1000.0
-            reference = QuietReference(axis, cutoff, self.baseline_time,
-                                       self._reference_noise_limit(axis) / count_g,
-                                       threshold_g=self.threshold_g[axis],
-                                       require_quiet=not (self.workflows.calibration_reference(axis)
-                                                          or self._uses_vector_detector(axis)))
+            def new_reference(cutoff):
+                return QuietReference(axis, cutoff, self.baseline_time,
+                                      self._reference_noise_limit(axis) / count_g,
+                                      threshold_g=self.threshold_g[axis],
+                                      require_quiet=self._reference_requires_quiet(axis))
+            reference = new_reference(cutoff)
+            first_ready = None
             with self.lock:
                 self.recent.clear()
                 self.tail = None
@@ -1230,8 +1233,28 @@ class BeaconAccelHoming:
                 sensor_now = self.main_mcu.estimated_print_time(now)
                 if (ready and last is not None and self._sample_time_valid(sensor_now, last)
                         and self._reference_receiving(reference, now)):
-                    self._remember_reference(reference, sensor_now, "acquisition", "ready")
-                    return
+                    with self.lock:
+                        quiet = (not reference.require_quiet
+                                 or self._reference_quiet_for_proof(reference, axis))
+                    if first_ready is None:
+                        first_ready = now
+                    waited = now - first_ready
+                    if quiet or waited > QUIET_REFERENCE_MAX_WAIT:
+                        self._remember_reference(reference, sensor_now, "acquisition", "ready")
+                        if not quiet:
+                            self._note_not_quiet(reference, axis, waited)
+                        return
+                    # Selected-axis homes prefer a reference quiet enough for
+                    # the startup motion proof (for example after re-enabled
+                    # motors snap into position): restart until it is, then
+                    # fall back to the noise-bounded proof of this reference.
+                    # The fresh window starts right after the last accepted
+                    # sample, so stream continuity and delivery latency are
+                    # unaffected; only the noisy history is discarded.
+                    started = now
+                    reference = new_reference(last)
+                    with self.lock:
+                        self.preparation = reference
                 if now - started > self.baseline_time + STREAM_START_TIMEOUT:
                     raise self._baseline_error(reference, sensor_now, "acquisition", "acquisition_timeout")
                 self.reactor.pause(now + 0.005)
@@ -1245,11 +1268,7 @@ class BeaconAccelHoming:
         """Keep one constant-size summary through workflow/session cleanup."""
         axis = reference.axis if reference is not None else axis
         count_g = self.session_scale["scale"] / 1000.0
-        mapping = ([(0, 1), (1, 1), (2, 1)] if self.backend is not None
-                   else self.helper.config.axes_map)
-        def mapped(values):
-            return {name: round(values[index] * count_g, 6)
-                    for name, (index, sign) in zip(("x", "y", "z"), mapping)}
+        mapped = self._mapped_g
         with self.lock:
             span = (0.0 if reference is None or reference.first is None
                     else reference.last - reference.first)
@@ -1289,6 +1308,14 @@ class BeaconAccelHoming:
                                         else round(reference.newest_batch_age * 1000.0, 3)),
             }
 
+    def _mapped_g(self, values):
+        """Raw-count per-axis values as machine-axis g."""
+        count_g = self.session_scale["scale"] / 1000.0
+        mapping = ([(0, 1), (1, 1), (2, 1)] if self.backend is not None
+                   else self.helper.config.axes_map)
+        return {name: round(values[index] * count_g, 6)
+                for name, (index, sign) in zip(("x", "y", "z"), mapping)}
+
     def _baseline_error(self, reference, sensor_now, phase, result, axis=None):
         self._remember_reference(reference, sensor_now, phase, result, axis)
         detail = describe_reference(self.baseline_status)
@@ -1299,8 +1326,34 @@ class BeaconAccelHoming:
                                           " sensor readings and delivery timing; see ACCEL_HOMING_STATUS"
                                           % (message, detail))
 
+    def _note_not_quiet(self, reference, axis, waited):
+        with self.lock:
+            peak = self._mapped_g(tuple(high - low for low, high in zip(reference.low, reference.high)))
+        message = ("accel_homing: standstill reference not quiet after %.1f s (range x %.3f / y %.3f"
+                   " / z %.3f g, limit %.3f g); continuing with noise-bounded reference"
+                   % (waited, peak["x"], peak["y"], peak["z"],
+                      BASELINE_NOISE_RATIO * self.threshold_g[axis]))
+        logging.info(message)
+        respond = getattr(self.printer.lookup_object("gcode", None), "respond_info", None)
+        if respond is not None:
+            respond(message)
+
     def _uses_vector_detector(self, axis):
         return self.workflows.simple_detection(axis)
+
+    def _reference_requires_quiet(self, axis):
+        """Quiet gate (and quiet wait) for the selected-axis detector only."""
+        if self._uses_vector_detector(axis):
+            return False
+        if self.workflows.calibration_reference(axis):
+            # XYZ calibration keeps the amplitude-independent reference.
+            return self.workflows.session.get("impact_metric") == "selected_axis"
+        return True
+
+    def _reference_quiet_for_proof(self, reference, axis):
+        """Every axis range within the impact-relative limit (no proof noise bound)."""
+        original = BASELINE_NOISE_RATIO * self.threshold_g[axis] / (self.session_scale["scale"] / 1000.0)
+        return all(high - low <= original for low, high in zip(reference.low, reference.high))
 
     def _reference_noise_limit(self, axis):
         original = BASELINE_NOISE_RATIO * self.threshold_g[axis]
@@ -1312,9 +1365,7 @@ class BeaconAccelHoming:
         """Measured envelope for calibration and expanded quiet references."""
         if reference is None or bases is None or self._uses_vector_detector(axis):
             return None
-        original = BASELINE_NOISE_RATIO * self.threshold_g[axis] / (self.session_scale["scale"] / 1000.0)
-        if reference.require_quiet and not any(
-                high - low > original for low, high in zip(reference.low, reference.high)):
+        if reference.require_quiet and self._reference_quiet_for_proof(reference, axis):
             return None
         # Calibration omits the quiet-range gate, so its measured uncertainty
         # remains active even if a later impact candidate exceeds that range.

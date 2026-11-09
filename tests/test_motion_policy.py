@@ -1134,6 +1134,9 @@ class NativeExpandedReferenceTests(unittest.TestCase):
         self.assertEqual(attempt.reason, "no_motion")
         self.assertEqual(endstop.trigger_log.messages, [[HOST]])
 
+    # The epoch places arming just before the 32-bit wrap; accept the first
+    # (noise-bounded) reference so the quiet wait does not move it past the wrap.
+    @mock.patch.object(plugin, "QUIET_REFERENCE_MAX_WAIT", -1.0)
     def test_expanded_native_continuity_and_exact_end_duplicates_across_clock_wrap(self):
         epoch = 0x100000000 / self.clock_hz - 0.120
         obj, endstop = self.machine(threshold=1.0, epoch=epoch)
