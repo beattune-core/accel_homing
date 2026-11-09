@@ -1592,7 +1592,14 @@ class BeaconAccelHoming:
                 raise self.printer.command_error("accel_homing: derived native startup"
                                                  " and homing deadlines must be finite")
             motion_deadline = min(deadline, print_time + timeout)
+        # The before-arm summary replaces the acquisition one; keep what this
+        # pass's reference preparation reported about its quiet wait.
+        prepared = self.baseline_status
         self._remember_reference(reference, now, "before_arm", "ready", axis)
+        if (isinstance(prepared, dict) and prepared.get("phase") == "acquisition"
+                and prepared.get("result") == "ready" and prepared.get("axis") == axis):
+            self.baseline_status.update(quiet_wait_s=prepared.get("quiet_wait_s"),
+                                        quiet_fallback=prepared.get("quiet_fallback"))
         beacon_mcu = self.sensor_clock
         attempt = Attempt(endstop, self.passes, print_time,
                           beacon_mcu.print_time_to_clock(print_time) & 0xFFFFFFFF,

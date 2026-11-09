@@ -360,6 +360,24 @@ class RollingReferenceIntegrationTest(unittest.TestCase):
         reference = self.ringing_home(obj, endstop)
         self.assertTrue(reference.require_quiet)
 
+    def test_arm_event_carries_quiet_wait_of_its_own_home(self):
+        obj, endstop = self.machine(threshold=1.9, decay=1.2)
+        events = []
+        obj.troubleshoot = types.SimpleNamespace(
+            record_event=lambda kind, **fields: events.append((kind, fields)))
+        self.prepare(obj, endstop)
+        waited = obj.baseline_status["quiet_wait_s"]
+        self.assertIsNotNone(waited)
+        attempt = obj.prepare(endstop, obj.backend.last_sample_time + 1 / 3200.0)
+        # prepare() re-summarizes the reference; it must keep the wait result.
+        self.assertEqual(obj.baseline_status["quiet_wait_s"], waited)
+        self.assertIsNotNone(obj.baseline_status["quiet_fallback"])
+        obj.arm(attempt)
+        arm = [fields for kind, fields in events if kind == "arm"]
+        self.assertEqual(len(arm), 1)
+        self.assertEqual(arm[0]["quiet_wait_s"], waited)
+        self.assertIsNotNone(arm[0]["quiet_fallback"])
+
     def test_selected_axis_steady_noise_falls_back_early_with_one_note(self):
         obj, endstop = self.machine(threshold=1.9, ringing=10.0)
         notes = []
