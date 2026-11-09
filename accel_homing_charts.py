@@ -807,6 +807,69 @@ def beta_motion_statistics(capture, record):
     return result
 
 
+SELECTED_AXIS_RATIO_LIMIT = 0.7
+SELECTED_AXIS_MIN_WINDOW_G = 0.5
+IMPACT_PEAK_WINDOW_S = 0.03
+NOISE_ONSET_GUARD_S = 0.003
+
+
+def motion_noise_peaks(statistics, axis):
+    """Return (homing-axis peak, XYZ magnitude peak) over seed-eligible phases."""
+    if axis not in ("x", "y", "z"):
+        raise ValueError("Axis must be x, y or z")
+    peaks = [phase["axis_absolute_peak_g"][axis] for phase in statistics.get("phases") or ()
+             if phase.get("seed_eligible") and phase.get("axis_absolute_peak_g")]
+    magnitude = statistics.get("seed_magnitude_peak_g")
+    if not peaks or not _finite(magnitude) or not all(_finite(peak) for peak in peaks):
+        raise ValueError("Motion statistics have no finite seed-phase peaks")
+    return max(peaks), magnitude
+
+
+def choose_impact_metric(axis_peak_g, magnitude_peak_g):
+    """Pick the homing-axis signal only when it is clearly smaller than XYZ magnitude."""
+    if not _finite(axis_peak_g) or not _finite(magnitude_peak_g):
+        raise ValueError("Axis and magnitude peaks must be finite numbers")
+    if magnitude_peak_g > 0 and axis_peak_g / magnitude_peak_g < SELECTED_AXIS_RATIO_LIMIT:
+        return "selected_axis"
+    return "xyz_magnitude"
+
+
+def axis_check_peaks(capture, axis):
+    """Return (pre-impact noise peak, impact peak) of |a_axis - baseline| in g."""
+    if axis not in ("x", "y", "z"):
+        raise ValueError("Axis must be x, y or z")
+    detector = capture.get("detector") or {}
+    arm, onset = detector.get("arm_time_s"), detector.get("onset_time_s")
+    if not _finite(arm) or not _finite(onset):
+        raise ValueError("Capture detector arm/onset times are missing or not finite")
+    channel, reference = "xyz".index(axis) + 1, capture["baseline_g"]["xyz".index(axis)]
+    noise, impact = [], []
+    for row in capture["samples"]:
+        value = abs(row[channel] - reference)
+        if arm <= row[0] < onset - NOISE_ONSET_GUARD_S:
+            noise.append(value)
+        elif onset <= row[0] < onset + IMPACT_PEAK_WINDOW_S:
+            impact.append(value)
+    if not noise or not impact:
+        raise ValueError("Capture has no samples in the noise or impact window")
+    return max(noise), max(impact)
+
+
+def selected_axis_threshold(noise_peaks, impact_peaks):
+    """Midpoint between the largest noise peak and smallest impact peak."""
+    for peaks in (noise_peaks, impact_peaks):
+        if not peaks or not all(_finite(peak) for peak in peaks):
+            raise ValueError("Peak lists must be non-empty finite numbers")
+    noise_max, impact_min = max(noise_peaks), min(impact_peaks)
+    window = impact_min - noise_max
+    if window < SELECTED_AXIS_MIN_WINDOW_G:
+        raise ValueError(
+            "Selected-axis window %.3f g (noise max %.3f g, impact min %.3f g) is below %.3f g"
+            % (window, noise_max, impact_min, SELECTED_AXIS_MIN_WINDOW_G))
+    return {"threshold_g": (noise_max + impact_min) / 2, "noise_max_g": noise_max,
+            "impact_min_g": impact_min, "window_g": window}
+
+
 def compact_beta_home(capture, record):
     """Keep a bounded display trace after exact full-row beta event analysis."""
     trace, metadata = _capture_data(capture, record)
