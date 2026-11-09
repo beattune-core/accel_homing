@@ -2134,6 +2134,8 @@ class AccelHomingWorkflows:
 
     def _run_calibration(self):
         session = self.session
+        # The stationary preflight overwrites start_threshold_g with its seed.
+        session.setdefault("configured_start_threshold_g", session["start_threshold_g"])
         try:
             self._calibration_noise_preflight(session)
             if "impact_metric" not in session:
@@ -2455,16 +2457,19 @@ class AccelHomingWorkflows:
                     raise self._error("Beta cleanup failed: " + "; ".join(cleanup_errors))
 
     @staticmethod
-    def _motion_required(session, peak):
-        start = Decimal(str(session["start_threshold_g"]))
+    def _motion_required(session, peak, start=None):
+        start = Decimal(str(session["start_threshold_g"] if start is None else start))
         return max(start, Decimal("1.2") * Decimal(str(peak)), Decimal(str(peak)) + Decimal("0.1"))
 
-    def _motion_seed(self, session, peak):
-        """Smallest grid candidate above the moving-noise peak (Beta's margin rule)."""
-        start = Decimal(str(session["start_threshold_g"]))
+    def _motion_seed(self, session, peak, start=None):
+        """Smallest grid candidate above the moving-noise peak (Beta's margin rule).
+
+        ``start`` is the grid origin and floor; it defaults to the session start."""
+        start = session["start_threshold_g"] if start is None else start
+        origin = Decimal(str(start))
         step = Decimal(str(session["threshold_step_g"]))
-        required = self._motion_required(session, peak)
-        return float(start + math.ceil((required - start) / step) * step)
+        required = self._motion_required(session, peak, start)
+        return float(origin + math.ceil((required - origin) / step) * step)
 
     def _select_calibration_metric(self, session):
         """Measure moving noise with Beta's central strokes and choose the impact metric."""
@@ -2502,7 +2507,9 @@ class AccelHomingWorkflows:
                                        "reason": None}
         peak = axis_peak if metric == "selected_axis" else magnitude_peak
         if not session["explicit_start_threshold"]:
-            candidate = self._motion_seed(session, peak)
+            # The moving seed replaces the stationary seed: anchor it to the
+            # configured grid start, not the stationary candidate.
+            candidate = self._motion_seed(session, peak, session["configured_start_threshold_g"])
             self._validate_calibration_threshold(candidate, "moving-noise initial candidate")
             if candidate <= peak:
                 raise self._error("moving-noise initial candidate must exceed the measured peak")

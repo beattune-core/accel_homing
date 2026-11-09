@@ -43,6 +43,17 @@ class SelectedAxisCalibrationTests(unittest.TestCase):
         self.assertEqual(rig.home_calls[0]["threshold"], 1.75)
         self.assertTrue(rig.central_moves())
 
+    def test_moving_seed_replaces_higher_stationary_seed(self):
+        rig = NoiseRig(noise=(3.1, 1.4))
+        rig.amplitudes = (1.5, .005, .002)
+        rig.home_results.extend([{"impact_metric": "selected_axis"}] * 11)
+        rig.workflow.cmd_CALIBRATE(GCmd(AXIS="Y", CENTERED=1, SAVE_CONFIG=0))
+        session = rig.sessions[0]
+        self.assertGreater(session["noise_seed"]["start_threshold_g"], 1.75)
+        self.assertEqual(session["impact_metric"], "selected_axis")
+        self.assertEqual(session["start_threshold_g"], 1.75)
+        self.assertEqual(rig.home_calls[0]["threshold"], 1.75)
+
     def test_axis_dominated_noise_keeps_magnitude(self):
         rig = NoiseRig(noise=(3.1, .4))
         rig.workflow.cmd_CALIBRATE(GCmd(AXIS="X", CENTERED=1, SAVE_CONFIG=0))
