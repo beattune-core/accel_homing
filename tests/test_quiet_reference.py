@@ -237,11 +237,11 @@ class QuietReferenceTest(unittest.TestCase):
 
 
 class RollingReferenceIntegrationTest(unittest.TestCase):
-    def machine(self, legacy=False, threshold=0.5, ringing=None):
+    def machine(self, legacy=False, threshold=0.5, ringing=None, settled=0.02):
         """Without ``ringing`` an old -0.68 g extremum conflicts with a later
         +0.06 g step (quiet within 0.2 x threshold once the extremum is dropped);
-        with ``ringing``, X first rings
-        at +/-0.22 g (0.44 g p-p) for ``ringing`` s, then settles to +/-0.02 g."""
+        with ``ringing``, X first rings at +/-0.22 g (0.44 g p-p) for ``ringing`` s,
+        then alternates at +/-``settled`` g."""
         obj = generic(legacy=legacy, connect=False)
         obj.fake_printer.send_event("klippy:connect")
         obj.threshold_g["x"] = threshold
@@ -260,7 +260,7 @@ class RollingReferenceIntegrationTest(unittest.TestCase):
                 if ringing is None:
                     x = -0.68 if index == 0 else 0.06 if index >= 215 else 0.0
                 else:
-                    x = (0.22 if when - origin[0] < ringing else 0.02) * (1 if index % 2 else -1)
+                    x = (0.22 if when - origin[0] < ringing else settled) * (1 if index % 2 else -1)
                 rows.append((when, x * G, 0.0, G))
             number[0] += 16
             obj.backend.helper.emit({"data": rows})
@@ -369,6 +369,16 @@ class RollingReferenceIntegrationTest(unittest.TestCase):
         self.assertEqual(endstop._dispatch.started, [])
         attempt = obj.prepare(endstop, obj.backend.last_sample_time + 1 / 3200.0)
         self.assertIsNotNone(attempt.proof_noise)
+
+    def test_selected_axis_noise_above_floor_during_quiet_wait_is_not_masked(self):
+        # A ready but noisy window is kept and slides; noise above the 0.7 g
+        # floor resets it exactly as it would invalidate an acquired window
+        # before arm, so no older window is reinstated.
+        obj, endstop = self.machine(threshold=1.9, ringing=0.2, settled=0.5)
+        with self.assertRaisesRegex(CommandError, "acquisition timeout"):
+            self.prepare(obj, endstop)
+        self.assertEqual(endstop._dispatch.started, [])
+        self.assertFalse(obj.homing_active)
 
     def test_xyz_magnitude_reference_unchanged(self):
         obj, endstop = self.machine(threshold=1.9, ringing=0.5)

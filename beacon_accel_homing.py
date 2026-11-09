@@ -1203,12 +1203,10 @@ class BeaconAccelHoming:
             cutoff = self.main_mcu.estimated_print_time(started)
             axis = next(iter(self.session_axes))
             count_g = self.session_scale["scale"] / 1000.0
-            def new_reference(cutoff):
-                return QuietReference(axis, cutoff, self.baseline_time,
-                                      self._reference_noise_limit(axis) / count_g,
-                                      threshold_g=self.threshold_g[axis],
-                                      require_quiet=self._reference_requires_quiet(axis))
-            reference = new_reference(cutoff)
+            reference = QuietReference(axis, cutoff, self.baseline_time,
+                                       self._reference_noise_limit(axis) / count_g,
+                                       threshold_g=self.threshold_g[axis],
+                                       require_quiet=self._reference_requires_quiet(axis))
             first_ready = None
             with self.lock:
                 self.recent.clear()
@@ -1246,15 +1244,13 @@ class BeaconAccelHoming:
                         return
                     # Selected-axis homes prefer a reference quiet enough for
                     # the startup motion proof (for example after re-enabled
-                    # motors snap into position): restart until it is, then
-                    # fall back to the noise-bounded proof of this reference.
-                    # The fresh window starts right after the last accepted
-                    # sample, so stream continuity and delivery latency are
-                    # unaffected; only the noisy history is discarded.
+                    # motors snap into position). The ready window keeps
+                    # sliding over the newest baseline_time of samples, so it
+                    # turns quiet once ringing decays; otherwise fall back to
+                    # its noise-bounded proof after the maximum wait. If
+                    # above-floor noise later resets the window, the normal
+                    # acquisition timeout counts from its last ready moment.
                     started = now
-                    reference = new_reference(last)
-                    with self.lock:
-                        self.preparation = reference
                 if now - started > self.baseline_time + STREAM_START_TIMEOUT:
                     raise self._baseline_error(reference, sensor_now, "acquisition", "acquisition_timeout")
                 self.reactor.pause(now + 0.005)
