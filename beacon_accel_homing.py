@@ -1990,6 +1990,9 @@ class BeaconAccelHoming:
 
     def _troubleshoot_arm(self, attempt):
         try:
+            # Preparation records whether this reference had to be quiet and
+            # how long the selected-axis quiet wait delayed the arm.
+            reference = self.baseline_status if isinstance(self.baseline_status, dict) else {}
             self._troubleshoot_event("arm", axis=attempt.axis, pass_no=attempt.pass_no,
                 host_monotonic_s=attempt.last_data, arm_print_time_s=attempt.arm_time,
                 deadline_print_time_s=attempt.deadline, arm_sensor_clock=attempt.arm_clock,
@@ -2003,7 +2006,10 @@ class BeaconAccelHoming:
                 start_position_mm=getattr(attempt, "troubleshoot_start_position", None),
                 axis_start_position_mm=attempt.start_position,
                 proof_start_step_counts=attempt.proof_step_positions,
-                reference_signal_quality=attempt.reference_signal_quality)
+                reference_signal_quality=attempt.reference_signal_quality,
+                quiet_range_enforced=reference.get("quiet_range_enforced"),
+                quiet_wait_s=reference.get("quiet_wait_s"),
+                quiet_fallback=reference.get("quiet_fallback"))
         except Exception:
             pass
 

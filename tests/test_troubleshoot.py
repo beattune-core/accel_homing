@@ -12,7 +12,7 @@ import zipfile
 
 from harness import CommandError
 from test_accuracy_workflow import AccuracyRig
-from test_workflows import GCmd, workflow_module
+from test_workflows import BACK_OFF, GCmd, plugin, workflow_module
 
 import accel_homing_troubleshoot as diagnostics
 
@@ -38,7 +38,7 @@ class TroubleshootTests(unittest.TestCase):
         self.assertFalse(rig.capture_active)
         self.assertFalse(rig.workflow.in_home)
         self.assertEqual(rig.owner.threshold_g, {"x": 8.0, "y": 9.0})
-        self.assertEqual(rig.owner.back_off_dist, 5.0)
+        self.assertEqual(rig.owner.back_off_dist, BACK_OFF)
         self.assertEqual(rig.configfile.saved, {})
         self.assertEqual(rig.noise_calls, [])
         self.assertNotIn("SAVE_CONFIG", rig.scripts)
@@ -145,7 +145,7 @@ class TroubleshootTests(unittest.TestCase):
                     self.assertFalse(rig.workflow.in_home)
                     self.assertIsNone(rig.owner.troubleshoot)
                     self.assertTrue(Path(folder, "manifest.json").exists())
-                    self.assertEqual(rig.owner.back_off_dist, 5.0)
+                    self.assertEqual(rig.owner.back_off_dist, BACK_OFF)
                 with mock.patch.object(diagnostics, "render_bundle", side_effect=export_after_cleanup):
                     with self.assertRaises(CommandError):
                         rig.workflow.cmd_TROUBLESHOOT(GCmd(AXIS="X", SAMPLES=2, CENTERED=1))
@@ -293,6 +293,47 @@ class TroubleshootTests(unittest.TestCase):
             self.assertEqual(report["render"]["result"], "failed")
             self.assertTrue(Path(rig.workflow.last_result["artifacts"]["archive"]).is_file())
             self.restored(rig)
+
+    def test_per_axis_back_off_is_suppressed_per_home_and_released_per_axis(self):
+        back_off = {"x": 3.0, "y": 7.0}
+        with tempfile.TemporaryDirectory() as directory:
+            diagnostic = AccuracyRig({"charts_directory": directory})
+            reference = AccuracyRig({"charts_directory": directory})
+            for rig in (diagnostic, reference):
+                rig.owner.back_off_dist = dict(back_off)
+            during = []
+            diagnostic.on_home = lambda axis: during.append(dict(diagnostic.owner.back_off_dist))
+            with mock.patch.object(workflow_module, "write_accuracy"):
+                reference.accuracy(axis="XY", samples=2)
+            self.run_command(diagnostic, axis="XY")
+            self.assertTrue(during)
+            for distances in during:
+                self.assertEqual(distances, dict.fromkeys(back_off, 0.0))
+            # Same per-axis terminal release as ACCURACY; the configured map survives.
+            self.assertEqual(diagnostic.toolhead.moves, reference.toolhead.moves)
+            self.assertEqual(diagnostic.owner.back_off_dist, back_off)
+            report = self.read_report(diagnostic)
+            planned = [event for event in report["events"] if event["kind"] == "terminal_release_planned"]
+            self.assertEqual(planned[-1]["fields"]["axis"], "y")
+            self.assertEqual(planned[-1]["fields"]["back_off_mm"], back_off["y"])
+
+    def test_selected_axis_model_homes_keep_the_quiet_reference_requirement(self):
+        for metric, quiet in (("selected_axis", True), ("xyz_magnitude", False)):
+            with self.subTest(metric=metric), tempfile.TemporaryDirectory() as directory:
+                rig = AccuracyRig({"charts_directory": directory})
+                for method in ("_uses_vector_detector", "_reference_requires_quiet"):
+                    setattr(rig.owner, method,
+                            types.MethodType(getattr(plugin.BeaconAccelHoming, method), rig.owner))
+                rig.workflow.model = types.SimpleNamespace(
+                    thresholds={"x": rig.owner.threshold_g["x"]},
+                    metadata={"x": {"impact_metric": metric,
+                                    "polarity_policy": workflow_module.POLARITY_POLICY}})
+                seen = []
+                rig.on_home = lambda axis, rig=rig, seen=seen: seen.append(
+                    rig.owner._reference_requires_quiet(axis))
+                self.run_command(rig)
+                self.assertTrue(seen)
+                self.assertEqual(set(seen), {quiet})
 
 
 if __name__ == "__main__":

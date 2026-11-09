@@ -323,6 +323,18 @@ class LifecycleObservationTest(unittest.TestCase):
         self.assertEqual(event["backend"], "beacon_native")
         self.assertEqual(event["host_monotonic_s"], attempt.last_data)
 
+    def test_arm_reports_the_quiet_reference_wait(self):
+        obj = make_homing()
+        feed_baseline(obj)
+        obj.baseline_status = dict(obj.baseline_status or {}, quiet_range_enforced=True,
+                                   quiet_wait_s=0.42, quiet_fallback=False)
+        recorder = obj.troubleshoot = Recorder()
+        arm_axis(obj, "x", 200, 9000)
+        event = recorder.event("arm")
+        self.assertIs(event["quiet_range_enforced"], True)
+        self.assertEqual(event["quiet_wait_s"], 0.42)
+        self.assertIs(event["quiet_fallback"], False)
+
     def test_home_end_includes_all_counts_without_fabricating_halt_time(self):
         obj = make_homing()
         recorder = obj.troubleshoot = Recorder()
