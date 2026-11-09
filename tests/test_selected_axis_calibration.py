@@ -21,6 +21,8 @@ class NoiseRig(BetaRig):
         self.on_home = lambda axis: self.sessions.append(self.workflow.session)
         # (pre-impact noise peak, impact peak) on the homing axis, cycled per capture.
         self.axis_peaks = [(1., 3.)]
+        # Optional first-contact amplitude per capture; defaults to the impact peak.
+        self.first_contact = None
 
     def stop_capture(self):
         capture = super().stop_capture()
@@ -31,6 +33,7 @@ class NoiseRig(BetaRig):
             return capture
         axis = detector["axis"]
         noise, impact = self.axis_peaks[(self.capture_stops - 1) % len(self.axis_peaks)]
+        first = impact if self.first_contact is None else             self.first_contact[(self.capture_stops - 1) % len(self.first_contact)]
         t0 = capture["samples"][0][0]
         rows = []
         for number in range(41):
@@ -38,6 +41,8 @@ class NoiseRig(BetaRig):
             if number == 3:
                 value["xy".index(axis)] = noise
                 value["yx".index(axis)] = 3.1
+            elif number == 10:
+                value["xy".index(axis)] = first
             elif number == 12:
                 value["xy".index(axis)] = impact
             rows.append((t0 + number / 1000.,) + tuple(value))
@@ -295,7 +300,11 @@ class SelectedAxisModelTests(unittest.TestCase):
         md = json.loads(rig.configfile.saved[(MODEL, "y_metadata")])
         self.assertEqual(md["impact_metric"], "selected_axis")
         self.assertEqual(md["polarity_policy"], workflow_module.POLARITY_POLICY)
-        self.assertAlmostEqual(float(rig.configfile.saved[(MODEL, "y_threshold")]), 1.82)
+        # The window midpoint (1.82 g) is above the tested candidate, so the cap applies.
+        self.assertAlmostEqual(md["selected_axis_window"]["midpoint_g"], 1.82)
+        self.assertAlmostEqual(float(rig.configfile.saved[(MODEL, "y_threshold")]),
+                               md["tested_threshold_g"])
+        self.assertEqual(md["threshold_set_by"], "tested_cap")
         self.assertEqual(md["threshold_rule"], "window_midpoint")
         self.assertIsNone(md["threshold_margin_g"])
         self.assertEqual(md["metric_selection"]["source"], "moving_noise")
@@ -303,8 +312,7 @@ class SelectedAxisModelTests(unittest.TestCase):
         self.assertAlmostEqual(md["selected_axis_window"]["impact_min_g"], 2.21)
         self.assertAlmostEqual(md["selected_axis_window"]["window_g"], .78)
         self.assertEqual(md["selected_axis_window"]["noise_max_source"], "validation")
-        self.assertAlmostEqual(rig.workflow.last_result["saved_threshold_g"], 1.82)
-        self.assertTrue(any("window midpoint" in line for line in rig.output))
+        self.assertAlmostEqual(rig.workflow.last_result["saved_threshold_g"], md["tested_threshold_g"])
         self.assertTrue(md["calibration_quiet_range_enforced"])
 
     def test_selected_axis_model_records_both_metrics_margins(self):
@@ -322,7 +330,8 @@ class SelectedAxisModelTests(unittest.TestCase):
         md = json.loads(rig.configfile.saved[(MODEL, "y_metadata")])
         self.assertEqual(md["selected_axis_window"]["noise_max_source"], "moving_noise")
         self.assertAlmostEqual(md["selected_axis_window"]["noise_max_g"], 1.4)
-        self.assertAlmostEqual(float(rig.configfile.saved[(MODEL, "y_threshold")]), 1.805)
+        self.assertAlmostEqual(md["selected_axis_window"]["midpoint_g"], 1.805)
+        self.assertLessEqual(float(rig.configfile.saved[(MODEL, "y_threshold")]), 1.805)
 
     def test_early_trigger_onset_raises_noise_max(self):
         rig = selected_rig([(1., 3.)])
@@ -331,7 +340,52 @@ class SelectedAxisModelTests(unittest.TestCase):
         md = json.loads(rig.configfile.saved[(MODEL, "y_metadata")])
         self.assertEqual(md["selected_axis_window"]["noise_max_source"], "early_trigger")
         self.assertAlmostEqual(md["selected_axis_window"]["noise_max_g"], 1.9)
-        self.assertAlmostEqual(float(rig.configfile.saved[(MODEL, "y_threshold")]), 2.45)
+        self.assertAlmostEqual(md["selected_axis_window"]["midpoint_g"], 2.45)
+        self.assertLessEqual(float(rig.configfile.saved[(MODEL, "y_threshold")]), 2.45)
+
+    def test_window_uses_first_contact_not_the_bounce_peak(self):
+        # Bounce peaks are high (3.0 g) but the first contact is only 2.4 g.
+        rig = selected_rig([(1., 3.)])
+        rig.first_contact = [2.4, 2.6]
+        rig.workflow.cmd_CALIBRATE(GCmd(AXIS="Y", CENTERED=1, SAVE_CONFIG=0))
+        md = json.loads(rig.configfile.saved[(MODEL, "y_metadata")])
+        self.assertAlmostEqual(md["selected_axis_window"]["impact_min_g"], 2.4)
+        self.assertAlmostEqual(min(md["axis_first_contact_peak_g"]), 2.4)
+        self.assertAlmostEqual(min(md["axis_post_trigger_peak_g"]), 3.)
+        midpoint = (1.4 + 2.4) / 2
+        self.assertAlmostEqual(md["selected_axis_window"]["midpoint_g"], midpoint)
+        saved = float(rig.configfile.saved[(MODEL, "y_threshold")])
+        self.assertLessEqual(saved, midpoint + 1e-9)
+
+    def test_midpoint_is_saved_when_below_the_tested_candidate(self):
+        rig = selected_rig([(1., 2.)])
+        rig.workflow.cmd_CALIBRATE(GCmd(AXIS="Y", CENTERED=1, SAVE_CONFIG=0))
+        md = json.loads(rig.configfile.saved[(MODEL, "y_metadata")])
+        self.assertLess(md["selected_axis_window"]["midpoint_g"], md["tested_threshold_g"])
+        self.assertAlmostEqual(float(rig.configfile.saved[(MODEL, "y_threshold")]),
+                               md["selected_axis_window"]["midpoint_g"])
+        self.assertEqual(md["threshold_set_by"], "midpoint")
+
+    def test_saved_threshold_never_exceeds_the_tested_candidate(self):
+        rig = selected_rig([(1., 3.)])
+        rig.first_contact = [3.]
+        rig.workflow.cmd_CALIBRATE(GCmd(AXIS="Y", CENTERED=1, SAVE_CONFIG=0))
+        md = json.loads(rig.configfile.saved[(MODEL, "y_metadata")])
+        tested = md["tested_threshold_g"]
+        midpoint = md["selected_axis_window"]["midpoint_g"]
+        self.assertLess(tested, midpoint)
+        self.assertAlmostEqual(float(rig.configfile.saved[(MODEL, "y_threshold")]), tested)
+        self.assertEqual(md["threshold_set_by"], "tested_cap")
+
+    def test_narrow_first_contact_window_refuses_with_both_numbers(self):
+        rig = selected_rig([(1., 3.)])
+        rig.first_contact = [1.8]
+        with self.assertRaises(CommandError) as raised:
+            rig.workflow.cmd_CALIBRATE(GCmd(AXIS="Y", CENTERED=1, SAVE_CONFIG=0))
+        message = str(raised.exception)
+        for number in ("1.400", "1.800", "y_threshold"):
+            self.assertIn(number, message)
+        self.assertEqual(rig.configfile.saved, {})
 
     def test_narrow_window_refuses_to_save(self):
         rig = selected_rig([(1.8, 3.), (1., 2.1)])
@@ -348,7 +402,8 @@ class SelectedAxisModelTests(unittest.TestCase):
         reloaded = reload(model_options(self.calibrated_y()))
         reloaded.workflow._validate_model_connection()
         self.assertFalse(reloaded.workflow.simple_detection("y"))
-        self.assertAlmostEqual(reloaded.owner.threshold_g["y"], 1.82)
+        self.assertAlmostEqual(reloaded.owner.threshold_g["y"],
+                               float(model_options(self.calibrated_y())["y_threshold"]))
         reloaded.workflow.check_home_axes(["y"])
 
     def test_existing_xyz_model_and_manual_threshold_route_unchanged(self):

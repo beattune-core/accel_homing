@@ -810,6 +810,7 @@ def beta_motion_statistics(capture, record):
 SELECTED_AXIS_RATIO_LIMIT = 0.7
 SELECTED_AXIS_MIN_WINDOW_G = 0.5
 IMPACT_PEAK_WINDOW_S = 0.03
+FIRST_CONTACT_WINDOW_S = 0.001
 NOISE_ONSET_GUARD_S = 0.003
 
 
@@ -842,6 +843,28 @@ def axis_check_peaks(capture, axis):
     return _check_peaks(capture, lambda row, baseline: abs(row[index + 1] - baseline[index]))
 
 
+def axis_first_contact_peak(capture, axis):
+    """Return max |a_axis - baseline| in g over the first contact excursion.
+
+    The window starts at the onset sample (inclusive) and lasts
+    FIRST_CONTACT_WINDOW_S. The 30 ms impact peak of axis_check_peaks also
+    contains the bounce after the trigger; this is the amplitude the detector
+    had to beat on the first spike."""
+    if axis not in ("x", "y", "z"):
+        raise ValueError("Axis must be x, y or z")
+    index = "xyz".index(axis)
+    detector = capture.get("detector") or {}
+    onset = detector.get("onset_time_s")
+    if not _finite(onset):
+        raise ValueError("Capture detector onset time is missing or not finite")
+    baseline = capture["baseline_g"]
+    values = [abs(row[index + 1] - baseline[index]) for row in capture["samples"]
+              if onset <= row[0] <= onset + FIRST_CONTACT_WINDOW_S + 1e-9]
+    if not values:
+        raise ValueError("Capture has no samples in the first-contact window")
+    return max(values)
+
+
 def magnitude_check_peaks(capture):
     """Return (pre-impact noise peak, impact peak) of |a - baseline| (XYZ magnitude) in g,
     over the same windows as axis_check_peaks."""
@@ -867,19 +890,23 @@ def _check_peaks(capture, signal):
     return max(noise), max(impact)
 
 
-def selected_axis_threshold(noise_peaks, impact_peaks):
-    """Midpoint between the largest noise peak and smallest impact peak."""
-    for peaks in (noise_peaks, impact_peaks):
+def selected_axis_threshold(noise_peaks, first_contact_peaks, tested_threshold=None):
+    """Midpoint between the largest noise peak and the weakest first-contact
+    amplitude, never above the tested threshold when one is given."""
+    for peaks in (noise_peaks, first_contact_peaks):
         if not peaks or not all(_finite(peak) for peak in peaks):
             raise ValueError("Peak lists must be non-empty finite numbers")
-    noise_max, impact_min = max(noise_peaks), min(impact_peaks)
+    noise_max, impact_min = max(noise_peaks), min(first_contact_peaks)
     window = impact_min - noise_max
     if window < SELECTED_AXIS_MIN_WINDOW_G:
         raise ValueError(
-            "Selected-axis window %.3f g (noise max %.3f g, impact min %.3f g) is below %.3f g"
+            "Selected-axis window %.3f g (noise max %.3f g, first-contact min %.3f g) is below %.3f g"
             % (window, noise_max, impact_min, SELECTED_AXIS_MIN_WINDOW_G))
-    return {"threshold_g": (noise_max + impact_min) / 2, "noise_max_g": noise_max,
-            "impact_min_g": impact_min, "window_g": window}
+    midpoint = (noise_max + impact_min) / 2
+    capped = tested_threshold is not None and tested_threshold < midpoint
+    return {"threshold_g": tested_threshold if capped else midpoint, "midpoint_g": midpoint,
+            "threshold_set_by": "tested_cap" if capped else "midpoint",
+            "noise_max_g": noise_max, "impact_min_g": impact_min, "window_g": window}
 
 
 def compact_beta_home(capture, record):

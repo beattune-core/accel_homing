@@ -42,6 +42,31 @@ class SelectedAxisSignalTests(unittest.TestCase):
         self.assertAlmostEqual(noise, 1.3)
         self.assertAlmostEqual(impact, 2.4)
 
+    def test_first_contact_peak_ignores_the_later_bounce(self):
+        capture = make_capture()
+        capture["samples"] = [(t, x, y + (2.1 if abs(t - 10.5) < 1e-9 else 0.), z)
+                              for t, x, y, z in capture["samples"]]
+        self.assertAlmostEqual(charts.axis_first_contact_peak(capture, "y"), 2.1)
+        _noise, post_trigger = charts.axis_check_peaks(capture, "y")
+        self.assertGreater(post_trigger, 2.1)
+
+    def test_first_contact_window_is_one_ms_inclusive_of_onset(self):
+        capture = {"samples": [(10.000, 0., 0.2, 0.), (10.001, 0., 1.0, 0.),
+                               (10.002, 0., 9.0, 0.)],
+                   "baseline_g": (0., 0.2, 0.), "detector": {"onset_time_s": 10.000}}
+        self.assertAlmostEqual(charts.axis_first_contact_peak(capture, "y"), 0.8)
+        capture["detector"]["onset_time_s"] = None
+        with self.assertRaises(ValueError):
+            charts.axis_first_contact_peak(capture, "y")
+
+    def test_threshold_is_capped_at_the_tested_candidate(self):
+        r = charts.selected_axis_threshold([1.5], [2.5], 1.8)
+        self.assertAlmostEqual(r["threshold_g"], 1.8)
+        self.assertEqual(r["threshold_set_by"], "tested_cap")
+        r = charts.selected_axis_threshold([1.5], [2.5], 2.4)
+        self.assertAlmostEqual(r["threshold_g"], 2.0)
+        self.assertEqual(r["threshold_set_by"], "midpoint")
+
     def test_axis_check_peaks_refuses_missing_windows(self):
         capture = make_capture()
         capture["detector"]["onset_time_s"] = None

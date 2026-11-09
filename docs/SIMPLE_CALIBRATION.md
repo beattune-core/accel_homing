@@ -100,13 +100,20 @@ moving-noise pre-pass ...; calibrating with XYZ magnitude` and continues. A canc
 the pre-pass aborts calibration.
 
 A selected-axis model saves the midpoint between the highest pre-impact
-homing-axis noise peak and the weakest homing-axis impact peak over the ten
-checks (noise window: arm to 3 ms before onset; impact window: 30 ms after
-onset). The noise maximum also includes the pre-pass moving homing-axis peak
+homing-axis noise peak and the weakest homing-axis first-contact amplitude over
+the ten checks, but never more than the candidate threshold the ten checks
+tested (noise window: arm to 3 ms before onset; first-contact window: the onset
+sample plus 1 ms). The first-contact amplitude is used rather than the 30 ms
+post-trigger peak because that peak includes the bounce after the trigger,
+while the detector has to beat the first contact spike, which can be much
+weaker. `threshold_set_by` (`midpoint` or `tested_cap`) records which rule set
+the saved value; `axis_first_contact_peak_g` and `axis_post_trigger_peak_g` hold
+the per-check values. The noise maximum also includes the pre-pass moving homing-axis peak
 and the onset of any selected-axis early trigger in this calibration;
 `selected_axis_window.noise_max_source` (`validation`, `moving_noise` or
 `early_trigger`) records which one set it. A window narrower than 0.5 g is
-refused rather than saved; check the mechanics and calibrate again, or set a
+refused rather than saved (the message prints the noise maximum and the
+first-contact minimum); check the mechanics and calibrate again, or set a
 manual `x_threshold` / `y_threshold` inside the measured window. XYZ models
 still save the tested threshold plus 0.5 g. The model records
 `impact_metric`, `threshold_rule` (`window_midpoint` or `tested_plus_margin`),

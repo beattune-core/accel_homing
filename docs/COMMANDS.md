@@ -67,7 +67,7 @@ applied once after qualification. Those checks test the candidate; they do not
 test the higher saved value. The other axis is unchanged.
 
 Calibration first runs a moving-noise pre-pass and switches to the
-`selected_axis` metric (window-midpoint threshold) when noise is mostly
+`selected_axis` metric (window-midpoint threshold, capped at the tested candidate) when noise is mostly
 cross-axis; see [cross-axis noise](SIMPLE_CALIBRATION.md#cross-axis-noise-and-the-selected-axis-metric).
 
 Both commands first measure fresh stationary noise. The default start grid is
