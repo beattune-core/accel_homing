@@ -54,7 +54,9 @@ if __package__:
                                       write_noise_capture, beta_motion_statistics,
                                       compact_beta_home, write_beta_motion, prepare_capture,
                                       publish_captures, prepare_noise, publish_noise,
-                                      motion_noise_peaks, choose_impact_metric)
+                                      motion_noise_peaks, choose_impact_metric,
+                                      axis_check_peaks, selected_axis_threshold,
+                                      SELECTED_AXIS_MIN_WINDOW_G)
 else:  # Standalone offline analysis; do not mask package dependency errors.
     from accel_homing_charts import (_accuracy_statistics as accuracy_statistics,
                                      PNGRenderer, default_dependency_directory, preflight_renderer,
@@ -62,7 +64,9 @@ else:  # Standalone offline analysis; do not mask package dependency errors.
                                      write_noise_capture, beta_motion_statistics,
                                      compact_beta_home, write_beta_motion, prepare_capture,
                                      publish_captures, prepare_noise, publish_noise,
-                                     motion_noise_peaks, choose_impact_metric)
+                                     motion_noise_peaks, choose_impact_metric,
+                                     axis_check_peaks, selected_axis_threshold,
+                                     SELECTED_AXIS_MIN_WINDOW_G)
 
 try:
     from .homing import PrinterHoming as _PrinterHoming
@@ -1514,6 +1518,19 @@ class AccelHomingWorkflows:
             self._validate_accuracy_capture(session, axis, source_record, detector_record,
                                             record, capture, record["workflow_threshold_g"])
             record["early_capture_valid"] = True
+        if (session["mode"] == "calibration" and not early_calibration
+                and record.get("result") == "impact"):
+            # Homing-axis margins: the selected-axis save rule, and diagnostics
+            # only for XYZ calibrations, which must not start failing on them.
+            try:
+                record["axis_noise_peak_g"], record["axis_impact_peak_g"] = \
+                    axis_check_peaks(capture, axis)
+            except (ValueError, KeyError, TypeError, IndexError) as exc:
+                # A capture without detector times/baseline cannot give margins.
+                if (session.get("impact_metric") == "selected_axis"
+                        and calibration_quality == "good"):
+                    raise self._error("selected-axis capture cannot be evaluated: %s" % exc)
+                record["axis_noise_peak_g"] = record["axis_impact_peak_g"] = None
         if session.get("beta"):
             if not early_calibration:
                 self._validate_accuracy_capture(session, axis, source_record, detector_record,
@@ -1982,7 +1999,8 @@ class AccelHomingWorkflows:
         # Final release may yield while its motion completes. Recheck all ten
         # accepted trials before staging any model settings.
         self._qualified_validation_records()
-        threshold = self._calibration_saved_threshold(tested_threshold)
+        selected = session.get("impact_metric", "xyz_magnitude") == "selected_axis"
+        threshold, window = self._saved_model_threshold(selected, tested_threshold, qualified)
         noise_png = None
         if session.get("deferred_noise_result") is not None:
             generation, preflight = self.owner.operation_generation, self.preflight_generation
@@ -2003,7 +2021,8 @@ class AccelHomingWorkflows:
             self._qualified_validation_records()
             # Rendering can yield; the final value must still fit the current
             # sensor headroom, not just the lower threshold used by the trials.
-            threshold = self._calibration_saved_threshold(tested_threshold)
+            threshold, window = self._saved_model_threshold(selected, tested_threshold, qualified)
+        margin = None if selected else CALIBRATION_THRESHOLD_MARGIN_G
         metadata = {"run_id": session["run_id"], **self._model_context(axis),
                     "polarity_policy": POLARITY_POLICY,
                     "signal_quality": [self._signal_metadata(record) for record in qualified],
@@ -2014,23 +2033,31 @@ class AccelHomingWorkflows:
                     "max_commanded_travel_mm": maximum,
                     "repeatability_spread_mm": spread,
                     "repeatability_limit_mm": CALIBRATION_REPEATABILITY_MM,
-                    "calibration_algorithm": SIMPLE_CALIBRATION, "impact_metric": "xyz_magnitude",
+                    "calibration_algorithm": SIMPLE_CALIBRATION,
+                    "impact_metric": "selected_axis" if selected else "xyz_magnitude",
                     "minimum_impact_travel_mm": CALIBRATION_MIN_TRAVEL_MM,
                     "discovery_impact_required": True, "recenter_policy": "selected_axis_midpoint",
                     "travel_plausibility_required": True,
                     "recenter_acceleration_policy": "restored_normal_limit",
                     "onset_g": [r.get("onset_g") for r in qualified],
                     "impact_peak_g": [r.get("impact_peak_g") for r in qualified],
+                    "axis_noise_peak_g": [r.get("axis_noise_peak_g") for r in qualified],
+                    "axis_impact_peak_g": [r.get("axis_impact_peak_g") for r in qualified],
                     "calibration_start_threshold_g": session["start_threshold_g"],
                     "calibration_step_g": session["threshold_step_g"],
                     "tested_threshold_g": tested_threshold,
                     "saved_threshold_g": threshold,
-                    "threshold_margin_g": CALIBRATION_THRESHOLD_MARGIN_G,
+                    "threshold_rule": "window_midpoint" if selected else "tested_plus_margin",
+                    "threshold_margin_g": margin,
                     "saved_threshold_tested": False,
                     "calibration_quiet_range_enforced": session["quiet_range_enforced"],
                     "calibration_settle_time_s": session["calibration_settle_time_s"],
                     "recovery": self._calibration_recovery_status(session),
                     "physical_position_verified": False}
+        if selected:
+            metadata["metric_selection"] = dict(session.get("metric_selection") or {})
+            metadata["selected_axis_window"] = {key: window[key] for key in
+                                                ("noise_max_g", "impact_min_g", "window_g")}
         if session.get("noise_seed") is not None:
             metadata["stationary_noise_seed"] = dict(session["noise_seed"])
         if session.get("stationary_noise") is not None:
@@ -2050,7 +2077,8 @@ class AccelHomingWorkflows:
             configfile.set(self.config.get_name(), axis + "_threshold", encoded_threshold)
         result = {"result": "calibrated", "axis": axis, "threshold_g": threshold,
                   "tested_threshold_g": tested_threshold, "saved_threshold_g": threshold,
-                  "threshold_margin_g": CALIBRATION_THRESHOLD_MARGIN_G,
+                  "impact_metric": metadata["impact_metric"],
+                  "threshold_rule": metadata["threshold_rule"], "threshold_margin_g": margin,
                   "saved_threshold_tested": False,
                   "successes": REQUIRED_SUCCESSES, "model": self.model_name,
                   "run_id": session["run_id"], "save_config": session["save_config"],
@@ -2060,12 +2088,19 @@ class AccelHomingWorkflows:
         if recovery is not None:
             result.update(accuracy_recovery=dict(recovery), source_accuracy=session["source_accuracy"])
         save = session["save_config"]
+        if selected:
+            result["selected_axis_window"] = dict(metadata["selected_axis_window"])
         self._finish(result)
+        rule = ("selected_axis metric, window midpoint: homing-axis noise max %.4g g "
+                "(noise->threshold %.4g g), impact min %.4g g (threshold->impact %.4g g)" % (
+                    window["noise_max_g"], threshold - window["noise_max_g"],
+                    window["impact_min_g"], window["impact_min_g"] - threshold)
+                if selected else "tested threshold + %.1f g" % CALIBRATION_THRESHOLD_MARGIN_G)
         self._info("%s model %s: ten qualified homes tested at %.12g g with commanded "
                    "travel spread %s mm <= %.2f mm; staging %.12g g "
-                   "(tested threshold + %.1f g). The saved threshold was not tested by those homes. %s" % (
+                   "(%s). The saved threshold was not tested by those homes. %s" % (
             axis.upper(), self.model_name, tested_threshold, spread, CALIBRATION_REPEATABILITY_MM,
-            threshold, CALIBRATION_THRESHOLD_MARGIN_G,
+            threshold, rule,
             "The selected manual override is staged with this model." if recovery is not None and axis in self.manual_axes
             else "Explicit manual threshold overrides remain active." if axis in self.manual_axes
             else "The saved model supplies this axis threshold after restart."))
@@ -2097,6 +2132,21 @@ class AccelHomingWorkflows:
             except Exception as exc:
                 self.last_result["chart_error"] = str(exc)
                 logging.exception("accel_homing: qualified calibration noise PNG publication failed")
+
+    def _saved_model_threshold(self, selected, tested_threshold, qualified):
+        """Return (saved threshold, selected-axis window or None) for the session metric."""
+        if not selected:
+            return self._calibration_saved_threshold(tested_threshold), None
+        try:
+            window = selected_axis_threshold([r.get("axis_noise_peak_g") for r in qualified],
+                                             [r.get("axis_impact_peak_g") for r in qualified])
+        except ValueError as exc:
+            raise self._error("cannot save selected-axis calibration: %s; the saved threshold "
+                              "needs a homing-axis noise-to-impact window of at least %.3f g "
+                              "across the ten qualified homes" % (exc, SELECTED_AXIS_MIN_WINDOW_G))
+        threshold = window["threshold_g"]
+        self._validate_calibration_threshold(threshold, "saved selected-axis threshold")
+        return threshold, window
 
     def _calibration_saved_threshold(self, tested_threshold):
         # Always derive from the qualified candidate, never from an earlier

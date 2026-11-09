@@ -1,10 +1,13 @@
 """Calibration pre-pass selects the impact metric from moving cross-axis noise."""
+import json
 import math
 import unittest
 
 from harness import CommandError
 from test_beta_calibration import BetaRig
-from test_workflows import GCmd
+from test_workflows import GCmd, Rig, workflow_module
+
+MODEL = "accel_homing_model default"
 
 
 class NoiseRig(BetaRig):
@@ -14,6 +17,29 @@ class NoiseRig(BetaRig):
         self.noise = noise
         self.sessions = []
         self.on_home = lambda axis: self.sessions.append(self.workflow.session)
+        # (pre-impact noise peak, impact peak) on the homing axis, cycled per capture.
+        self.axis_peaks = [(1., 3.)]
+
+    def stop_capture(self):
+        capture = super().stop_capture()
+        detector = capture.get("detector")
+        if not detector:
+            return capture
+        axis = detector["axis"]
+        noise, impact = self.axis_peaks[(self.capture_stops - 1) % len(self.axis_peaks)]
+        t0 = capture["samples"][0][0]
+        rows = []
+        for number in range(41):
+            value = [0., 0., 1.]
+            if number == 3:
+                value["xy".index(axis)] = noise
+                value["yx".index(axis)] = 3.1
+            elif number == 12:
+                value["xy".index(axis)] = impact
+            rows.append((t0 + number / 1000.,) + tuple(value))
+        capture["samples"] = rows
+        detector.update(arm_time_s=t0 + .001, onset_time_s=t0 + .010)
+        return capture
 
     def stop_motion(self, token, check):
         check()
@@ -133,6 +159,94 @@ class SelectedAxisCalibrationTests(unittest.TestCase):
         self.assertEqual(moving[0], "good")
         self.assertEqual(unproven, ("fatal", "accelerometer did not establish motion before impact"))
         self.assertEqual(other[0], "fatal")
+
+
+
+def selected_rig(peaks):
+    rig = NoiseRig(noise=(3.1, 1.4))
+    rig.axis_peaks = peaks
+    rig.home_results.extend([{"impact_metric": "selected_axis"}] * 11)
+    return rig
+
+
+def model_options(rig):
+    return {key: value for (section, key), value in rig.configfile.saved.items() if section == MODEL}
+
+
+def reload(options, manual=None):
+    return Rig(manual, sections={"printer": {"kinematics": "corexy"}, MODEL: options})
+
+
+class SelectedAxisModelTests(unittest.TestCase):
+    def calibrated_y(self):
+        rig = selected_rig([(1.43, 3.), (1., 2.21)])
+        rig.workflow.cmd_CALIBRATE(GCmd(AXIS="Y", CENTERED=1, SAVE_CONFIG=0))
+        return rig
+
+    def test_selected_axis_model_saves_window_midpoint(self):
+        rig = self.calibrated_y()
+        md = json.loads(rig.configfile.saved[(MODEL, "y_metadata")])
+        self.assertEqual(md["impact_metric"], "selected_axis")
+        self.assertEqual(md["polarity_policy"], workflow_module.POLARITY_POLICY)
+        self.assertAlmostEqual(float(rig.configfile.saved[(MODEL, "y_threshold")]), 1.82)
+        self.assertEqual(md["threshold_rule"], "window_midpoint")
+        self.assertIsNone(md["threshold_margin_g"])
+        self.assertEqual(md["metric_selection"]["source"], "moving_noise")
+        self.assertAlmostEqual(md["selected_axis_window"]["noise_max_g"], 1.43)
+        self.assertAlmostEqual(md["selected_axis_window"]["impact_min_g"], 2.21)
+        self.assertAlmostEqual(md["selected_axis_window"]["window_g"], .78)
+        self.assertAlmostEqual(rig.workflow.last_result["saved_threshold_g"], 1.82)
+        self.assertTrue(any("window midpoint" in line for line in rig.output))
+
+    def test_narrow_window_refuses_to_save(self):
+        rig = selected_rig([(1.8, 3.), (1., 2.1)])
+        with self.assertRaises(CommandError) as raised:
+            rig.workflow.cmd_CALIBRATE(GCmd(AXIS="Y", CENTERED=1, SAVE_CONFIG=0))
+        message = str(raised.exception)
+        for number in ("1.800", "2.100", "0.300", "0.500"):
+            self.assertIn(number, message)
+        self.assertEqual(rig.configfile.saved, {})
+
+    def test_saved_selected_axis_model_routes_to_selected_detector_on_ordinary_home(self):
+        reloaded = reload(model_options(self.calibrated_y()))
+        reloaded.workflow._validate_model_connection()
+        self.assertFalse(reloaded.workflow.simple_detection("y"))
+        self.assertAlmostEqual(reloaded.owner.threshold_g["y"], 1.82)
+        reloaded.workflow.check_home_axes(["y"])
+
+    def test_existing_xyz_model_and_manual_threshold_route_unchanged(self):
+        xyz = Rig()
+        xyz.calibrate("X", save=0)
+        options = dict(model_options(xyz), **model_options(self.calibrated_y()))
+        reloaded = reload(options, {"y_threshold": 6.0})
+        reloaded.workflow._validate_model_connection()
+        self.assertTrue(reloaded.workflow.simple_detection("x"))
+        self.assertEqual(reloaded.owner.threshold_g["x"], 1.5)
+        self.assertFalse(reloaded.workflow.simple_detection("y"))
+        # The rig's core keeps its own manual value; the saved Y model must not replace it.
+        self.assertIn("y", reloaded.workflow.manual_axes)
+        self.assertNotAlmostEqual(reloaded.owner.threshold_g["y"], 1.82)
+
+    def test_xyz_calibration_still_saves_tested_plus_half_g(self):
+        rig = Rig()
+        rig.calibrate("X", save=0)
+        md = json.loads(rig.configfile.saved[(MODEL, "x_metadata")])
+        self.assertEqual(rig.configfile.saved[(MODEL, "x_threshold")], "1.5")
+        self.assertEqual(md["impact_metric"], "xyz_magnitude")
+        self.assertEqual(md["threshold_rule"], "tested_plus_margin")
+        self.assertEqual(md["threshold_margin_g"], .5)
+        self.assertEqual(md["tested_threshold_g"], 1.)
+
+    def test_xyz_calibration_records_homing_axis_peaks_as_diagnostics(self):
+        rig = NoiseRig(noise=(3.1, .4))
+        rig.axis_peaks = [(.6, 2.5)]
+        rig.workflow.cmd_CALIBRATE(GCmd(AXIS="X", CENTERED=1, SAVE_CONFIG=0))
+        md = json.loads(rig.configfile.saved[(MODEL, "x_metadata")])
+        self.assertEqual(md["impact_metric"], "xyz_magnitude")
+        self.assertEqual(set(md["axis_noise_peak_g"]), {.6})
+        self.assertEqual(set(md["axis_impact_peak_g"]), {2.5})
+        self.assertEqual(rig.configfile.saved[(MODEL, "x_threshold")],
+                         "%.17g" % (md["tested_threshold_g"] + .5))
 
 
 if __name__ == "__main__":
